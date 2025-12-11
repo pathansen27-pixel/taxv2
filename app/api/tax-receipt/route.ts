@@ -34,7 +34,7 @@ type Representative = {
 
 /**
  * 📌 Key federal spending bills we want voting history for.
- * This is where you hardcode the bills you want to track.
+ * For now we keep this list small and curated.
  */
 const TARGET_BILLS = [
   {
@@ -44,6 +44,41 @@ const TARGET_BILLS = [
     title: "Consolidated Appropriations Act, 2024"
   }
 ];
+
+/**
+ * 🗳 Congress.gov API helper (via api.data.gov)
+ * This is a generic wrapper we’ll use when we start pulling real votes.
+ */
+const CONGRESS_API_BASE = "https://api.congress.gov/v3";
+
+async function congressFetch(
+  path: string,
+  params: Record<string, string | number> = {}
+): Promise<any> {
+  const apiKey = process.env.CONGRESS_API_KEY;
+  if (!apiKey) {
+    throw new Error("CONGRESS_API_KEY is not set");
+  }
+
+  const searchParams = new URLSearchParams({
+    api_key: apiKey,
+    format: "json"
+  });
+
+  for (const [key, value] of Object.entries(params)) {
+    searchParams.set(key, String(value));
+  }
+
+  const url = `${CONGRESS_API_BASE}${path}?${searchParams.toString()}`;
+
+  const res = await fetch(url);
+
+  if (!res.ok) {
+    throw new Error(`Congress.gov API error: ${res.status} ${res.statusText}`);
+  }
+
+  return res.json();
+}
 
 /**
  * 🔥 REAL REPRESENTATIVE LOOKUP USING 5 CALLS API
@@ -75,7 +110,7 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
       name: rep.name,
       chamber: rep.branch === "upper" ? "senate" : "house",
       party: rep.party || "",
-      votes: [], // we will fill this later
+      votes: [], // we will fill this with real votes in the next step
       source: "real"
     }));
   } catch (err) {
@@ -110,6 +145,20 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
   }
 }
 
+/**
+ * 🧩 Attach voting history to each representative.
+ * Right now this is a stub that returns reps unchanged; next iteration,
+ * we’ll use `congressFetch` + TARGET_BILLS to fill in real vote data.
+ */
+async function attachVotesToReps(
+  reps: Representative[]
+): Promise<Representative[]> {
+  // Placeholder implementation: no votes yet, just return reps as-is.
+  // In the next step, we’ll loop through TARGET_BILLS and use congressFetch
+  // to fetch roll call votes and match them to each rep.
+  return reps;
+}
+
 export async function POST(req: NextRequest) {
   const body = (await req.json()) as TaxRequest;
   const income = Number(body.income);
@@ -142,7 +191,8 @@ export async function POST(req: NextRequest) {
     amount: Math.round(estimatedTax * item.share * 100) / 100
   }));
 
-  const representatives = await getRepsForZip(zip);
+  const baseReps = await getRepsForZip(zip);
+  const representatives = await attachVotesToReps(baseReps);
 
   return NextResponse.json({
     incomeBucket,
