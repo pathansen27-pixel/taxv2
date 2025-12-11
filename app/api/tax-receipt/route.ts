@@ -33,7 +33,8 @@ type Representative = {
 };
 
 /**
- * 📌 Key federal spending bills we want voting history for.
+ * 📌 Key federal funding / spending laws we want voting history for.
+ * These are all large, high-dollar laws that directly affect where tax money goes.
  */
 const TARGET_BILLS = [
   {
@@ -41,6 +42,24 @@ const TARGET_BILLS = [
     congress: 118,
     chamber: "House",
     title: "Consolidated Appropriations Act, 2024"
+  },
+  {
+    billId: "HR3684",
+    congress: 117,
+    chamber: "House",
+    title: "Infrastructure Investment and Jobs Act (2021)"
+  },
+  {
+    billId: "HR1319",
+    congress: 117,
+    chamber: "House",
+    title: "American Rescue Plan Act of 2021"
+  },
+  {
+    billId: "HR5376",
+    congress: 117,
+    chamber: "House",
+    title: "Inflation Reduction Act of 2022"
   }
 ];
 
@@ -146,11 +165,13 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 
 /**
  * 🧩 Attach voting history to each representative.
- * For now this is a DEMO implementation:
- *  - Democrats → Yea on HR4366
- *  - Republicans → Nay on HR4366
- * This gives you specific-looking voting records in the UI.
- * Later, we’ll replace this with real Congress.gov data.
+ * DEMO RULE:
+ *  - Democrats → Yea on all listed funding bills
+ *  - Republicans → Nay on all listed funding bills
+ *  - No party info → Not Voting
+ *
+ * This gives you a multi-bill "history" view right now.
+ * Later we’ll replace this logic with real Congress.gov roll-call data.
  */
 async function attachVotesToReps(
   reps: Representative[]
@@ -161,7 +182,7 @@ async function attachVotesToReps(
 
       if (rep.party === "R") {
         position = "Nay";
-      } else if (rep.party === "") {
+      } else if (!rep.party) {
         position = "Not Voting";
       }
 
