@@ -50,6 +50,35 @@ const BILL_SUMMARIES: Record<string, BillSummary> = {
   }
 };
 
+/**
+ * Map each bill to the broad budget categories it most directly influences.
+ * These names must match the `name` values coming from the API breakdown.
+ */
+const BILL_SPENDING_CATEGORIES: Record<string, string[]> = {
+  HR4366: [
+    "Social Security",
+    "Medicare",
+    "Health (incl. Medicaid)",
+    "National Defense",
+    "Income Security / Safety Net",
+    "Veterans’ Benefits",
+    "Everything Else"
+  ],
+  HR3684: [
+    // Infrastructure is captured inside the "Everything Else" bucket
+    "Everything Else"
+  ],
+  HR1319: [
+    "Health (incl. Medicaid)",
+    "Income Security / Safety Net",
+    "Everything Else"
+  ],
+  HR5376: [
+    "Health (incl. Medicaid)",
+    "Everything Else"
+  ]
+};
+
 export default function Home() {
   const [income, setIncome] = useState<string>("");
   const [zip, setZip] = useState<string>("");
@@ -103,6 +132,33 @@ export default function Home() {
     selectedBillId && BILL_SUMMARIES[selectedBillId]
       ? BILL_SUMMARIES[selectedBillId]
       : null;
+
+  // Compute how much of *this user's* estimated tax is tied to the bill's categories
+  let billTaxSharePercent: number | null = null;
+  let billTaxAmount: number | null = null;
+  let affectedCategories: string[] = [];
+
+  if (
+    selectedBill &&
+    result &&
+    Array.isArray(result.breakdown) &&
+    typeof result.estimatedFederalIncomeTax === "number"
+  ) {
+    const categories =
+      BILL_SPENDING_CATEGORIES[selectedBill.billId] || [];
+    affectedCategories = categories;
+
+    const totalShare = result.breakdown
+      .filter((item: any) => categories.includes(item.name))
+      .reduce((sum: number, item: any) => sum + (item.share || 0), 0);
+
+    if (totalShare > 0) {
+      billTaxSharePercent = Math.round(totalShare * 1000) / 10; // one decimal place
+      billTaxAmount = Math.round(
+        result.estimatedFederalIncomeTax * totalShare
+      );
+    }
+  }
 
   return (
     <main
@@ -449,6 +505,53 @@ export default function Home() {
                   <p style={{ margin: 0, color: "#444", lineHeight: 1.4 }}>
                     {selectedBill.description}
                   </p>
+
+                  {billTaxSharePercent !== null && billTaxAmount !== null && (
+                    <div
+                      style={{
+                        marginTop: 10,
+                        paddingTop: 8,
+                        borderTop: "1px solid #eee"
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: 12,
+                          color: "#374151",
+                          marginBottom: 2
+                        }}
+                      >
+                        Estimated portion of <strong>your</strong>{" "}
+                        federal income tax tied to the kinds of programs this law
+                        funds:
+                      </div>
+                      <div
+                        style={{
+                          fontSize: 14,
+                          fontWeight: 600,
+                          color: "#111827"
+                        }}
+                      >
+                        ~{billTaxSharePercent}% ({`$${billTaxAmount.toLocaleString(
+                          "en-US"
+                        )}`}
+                        )
+                      </div>
+                      {affectedCategories.length > 0 && (
+                        <div
+                          style={{
+                            marginTop: 4,
+                            fontSize: 11,
+                            color: "#6b7280"
+                          }}
+                        >
+                          Based on your tax going to:{" "}
+                          {affectedCategories.join(", ")}.
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div
                     style={{
                       marginTop: 8,
@@ -456,9 +559,9 @@ export default function Home() {
                       color: "#888"
                     }}
                   >
-                    You&apos;re seeing how your representatives voted on this law,
-                    which is one of the major ways Congress shapes where federal tax
-                    dollars are spent.
+                    This is a rough link between your estimated tax and the
+                    categories this law most directly funds. It&apos;s a simplified
+                    view meant for accountability, not official tax guidance.
                   </div>
                 </div>
               ) : (
@@ -473,7 +576,8 @@ export default function Home() {
                   }}
                 >
                   Click any bill title in the voting history above to see what that
-                  law funded and why it matters for how your tax dollars are used.
+                  law funded and how much of your estimated federal income tax it
+                  most likely touches.
                 </div>
               )}
             </div>
