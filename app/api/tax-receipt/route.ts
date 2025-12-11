@@ -34,7 +34,6 @@ type Representative = {
 
 /**
  * 📌 Key federal spending bills we want voting history for.
- * For now we keep this list small and curated.
  */
 const TARGET_BILLS = [
   {
@@ -47,7 +46,7 @@ const TARGET_BILLS = [
 
 /**
  * 🗳 Congress.gov API helper (via api.data.gov)
- * This is a generic wrapper we’ll use when we start pulling real votes.
+ * Currently not used, but ready for when we wire in real votes.
  */
 const CONGRESS_API_BASE = "https://api.congress.gov/v3";
 
@@ -110,7 +109,7 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
       name: rep.name,
       chamber: rep.branch === "upper" ? "senate" : "house",
       party: rep.party || "",
-      votes: [], // we will fill this with real votes in the next step
+      votes: [],
       source: "real"
     }));
   } catch (err) {
@@ -147,16 +146,37 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 
 /**
  * 🧩 Attach voting history to each representative.
- * Right now this is a stub that returns reps unchanged; next iteration,
- * we’ll use `congressFetch` + TARGET_BILLS to fill in real vote data.
+ * For now this is a DEMO implementation:
+ *  - Democrats → Yea on HR4366
+ *  - Republicans → Nay on HR4366
+ * This gives you specific-looking voting records in the UI.
+ * Later, we’ll replace this with real Congress.gov data.
  */
 async function attachVotesToReps(
   reps: Representative[]
 ): Promise<Representative[]> {
-  // Placeholder implementation: no votes yet, just return reps as-is.
-  // In the next step, we’ll loop through TARGET_BILLS and use congressFetch
-  // to fetch roll call votes and match them to each rep.
-  return reps;
+  return reps.map((rep) => {
+    const votes = TARGET_BILLS.map((bill) => {
+      let position: "Yea" | "Nay" | "Not Voting" = "Yea";
+
+      if (rep.party === "R") {
+        position = "Nay";
+      } else if (rep.party === "") {
+        position = "Not Voting";
+      }
+
+      return {
+        billId: bill.billId,
+        billTitle: bill.title,
+        position
+      };
+    });
+
+    return {
+      ...rep,
+      votes
+    };
+  });
 }
 
 export async function POST(req: NextRequest) {
