@@ -62,7 +62,7 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
       name: rep.name,
       chamber: rep.branch === "upper" ? "senate" : "house",
       party: rep.party || "",
-      votes: [], // we can fill this in later with real votes
+      votes: [], // ← we'll add real votes later
       source: "real"
     }));
   } catch (err) {
@@ -112,10 +112,19 @@ export async function POST(req: NextRequest) {
   const estimatedTax = estimateTax(income);
   const incomeBucket = bucketIncome(income);
 
+  /**
+   * 🧮 MORE REALISTIC BREAKDOWN OF FEDERAL SPENDING
+   * Shares based on high-level federal budget categories.
+   */
   const dummyBreakdown = [
-    { code: "650", name: "Social Security", share: 0.21 },
-    { code: "570", name: "Medicare", share: 0.14 },
-    { code: "050", name: "National Defense", share: 0.13 }
+    { code: "650", name: "Social Security", share: 0.24 },
+    { code: "570", name: "Medicare", share: 0.15 },
+    { code: "550", name: "Health (incl. Medicaid)", share: 0.15 },
+    { code: "050", name: "National Defense", share: 0.13 },
+    { code: "600", name: "Income Security / Safety Net", share: 0.11 },
+    { code: "900", name: "Net Interest on the Debt", share: 0.10 },
+    { code: "700", name: "Veterans’ Benefits", share: 0.05 },
+    { code: "999", name: "Everything Else", share: 0.07 }
   ].map((item) => ({
     ...item,
     amount: Math.round(estimatedTax * item.share * 100) / 100
