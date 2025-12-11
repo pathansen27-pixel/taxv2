@@ -33,6 +33,19 @@ type Representative = {
 };
 
 /**
+ * 📌 Key federal spending bills we want voting history for.
+ * This is where you hardcode the bills you want to track.
+ */
+const TARGET_BILLS = [
+  {
+    billId: "HR4366",
+    congress: 118,
+    chamber: "House",
+    title: "Consolidated Appropriations Act, 2024"
+  }
+];
+
+/**
  * 🔥 REAL REPRESENTATIVE LOOKUP USING 5 CALLS API
  */
 async function getRepsForZip(zip: string): Promise<Representative[]> {
@@ -62,7 +75,7 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
       name: rep.name,
       chamber: rep.branch === "upper" ? "senate" : "house",
       party: rep.party || "",
-      votes: [], // ← we'll add real votes later
+      votes: [], // we will fill this later
       source: "real"
     }));
   } catch (err) {
@@ -114,7 +127,6 @@ export async function POST(req: NextRequest) {
 
   /**
    * 🧮 MORE REALISTIC BREAKDOWN OF FEDERAL SPENDING
-   * Shares based on high-level federal budget categories.
    */
   const dummyBreakdown = [
     { code: "650", name: "Social Security", share: 0.24 },
