@@ -29,87 +29,68 @@ type Representative = {
     billTitle: string;
     position: "Yea" | "Nay" | "Not Voting";
   }[];
-  source?: "govtrack" | "fallback";
+  source?: string;
 };
 
+/**
+ * 🔥 REAL REPRESENTATIVE LOOKUP USING 5 CALLS API
+ */
 async function getRepsForZip(zip: string): Promise<Representative[]> {
-  const cleaned = zip.trim();
-
   try {
-    const response = await fetch(
-      `https://www.govtrack.us/api/v2/role?current=true&zip=${encodeURIComponent(
-        cleaned
-      )}`
-    );
+    const url = `https://api.5calls.org/v1/representatives?location=${encodeURIComponent(
+      zip
+    )}`;
 
-    if (!response.ok) {
-      throw new Error(`GovTrack request failed: ${response.status}`);
+    const res = await fetch(url, {
+      headers: {
+        "X-5Calls-Token": process.env.FIVECALLS_TOKEN || ""
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`5Calls API failed with status ${res.status}`);
     }
 
-    const data = await response.json();
+    const data = await res.json();
 
-    const reps: Representative[] = (data.objects || []).map((role: any) => ({
-      id:
-        role.person?.id?.toString() ??
-        role.id?.toString() ??
-        `${role.role_type}-${role.state}`,
-      name: role.person?.name || "Unknown",
-      chamber: role.role_type === "senator" ? "senate" : "house",
-      party: role.party || "Unknown",
-      votes: [],
-      source: "govtrack"
+    if (!data || !Array.isArray(data.representatives)) {
+      throw new Error("No representatives array in response");
+    }
+
+    return data.representatives.map((rep: any) => ({
+      id: rep.id || rep.bioguide || "unknown",
+      name: rep.name,
+      chamber: rep.branch === "upper" ? "senate" : "house",
+      party: rep.party || "",
+      votes: [], // we can fill this in later with real votes
+      source: "real"
     }));
-
-    if (reps.length > 0) {
-      return reps;
-    }
-
-    throw new Error("No reps returned for this ZIP");
   } catch (err) {
-    console.error("Error fetching reps from GovTrack:", err);
+    console.error("Rep lookup failed → using fallback", err);
 
-    // Fallback demo reps so the app always works
     return [
       {
-        id: "H001",
-        name: "Rep Example",
+        id: "fallback-H",
+        name: "Fallback Rep",
         chamber: "house",
         party: "D",
-        votes: [
-          {
-            billId: "HR1234",
-            billTitle: "Consolidated Appropriations Act 2024",
-            position: "Yea"
-          }
-        ],
+        votes: [],
         source: "fallback"
       },
       {
-        id: "S001",
-        name: "Senator One",
+        id: "fallback-S1",
+        name: "Fallback Senator 1",
         chamber: "senate",
         party: "R",
-        votes: [
-          {
-            billId: "HR1234",
-            billTitle: "Consolidated Appropriations Act 2024",
-            position: "Nay"
-          }
-        ],
+        votes: [],
         source: "fallback"
       },
       {
-        id: "S002",
-        name: "Senator Two",
+        id: "fallback-S2",
+        name: "Fallback Senator 2",
         chamber: "senate",
         party: "D",
-        votes: [
-          {
-            billId: "HR1234",
-            billTitle: "Consolidated Appropriations Act 2024",
-            position: "Yea"
-          }
-        ],
+        votes: [],
         source: "fallback"
       }
     ];
