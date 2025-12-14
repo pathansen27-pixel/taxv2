@@ -6,7 +6,7 @@ type TaxRequest = {
 };
 
 function estimateTax(income: number): number {
-  // Still a rough estimator. We will refine later.
+  // Rough estimator for Phase 1; we refine later.
   const standardDeduction = 14000;
   const taxable = Math.max(0, income - standardDeduction);
   const rate = 0.18;
@@ -40,7 +40,7 @@ type VoteItem = {
 };
 
 type Representative = {
-  id: string; // bioguide preferred
+  id: string; // bioguide preferred (needed for ProPublica)
   name: string;
   chamber: "house" | "senate";
   party: string;
@@ -62,7 +62,7 @@ const BUDGET_SHARES: Array<{ code: string; name: string; share: number }> = [
 ];
 
 function buildBreakdown(estimatedTax: number): BreakdownItem[] {
-  // Ensure shares sum to 1.00 (guardrail)
+  // Guardrail: normalize shares to 1.0
   const shareSum = BUDGET_SHARES.reduce((acc, x) => acc + x.share, 0);
   const normalized = BUDGET_SHARES.map((x) => ({
     ...x,
@@ -78,9 +78,11 @@ function buildBreakdown(estimatedTax: number): BreakdownItem[] {
 }
 
 function isFundingRelevantVote(v: any): boolean {
-  const text = `${v?.description || ""} ${v?.question || ""} ${v?.bill?.title || ""}`.toLowerCase();
+  const text = `${v?.description || ""} ${v?.question || ""} ${v?.bill?.title || ""}`
+    .toLowerCase()
+    .trim();
 
-  // Keep it tight to “money moving” items
+  // Keep Phase 1 tight to “money moving” items
   const keywords = [
     "appropriation",
     "appropriations",
@@ -94,12 +96,13 @@ function isFundingRelevantVote(v: any): boolean {
   ];
 
   const hasKeyword = keywords.some((k) => text.includes(k));
+
   const isPassageish =
     text.includes("on passage") ||
     text.includes("passage") ||
-    text.includes("on the motion") ||
     text.includes("conference report") ||
-    text.includes("cloture");
+    text.includes("cloture") ||
+    text.includes("on the motion");
 
   return hasKeyword && isPassageish;
 }
@@ -108,7 +111,6 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
   const token = process.env.FIVECALLS_TOKEN;
 
   if (!token) {
-    // If token not set, keep app working
     return [
       {
         id: "H001",
@@ -121,12 +123,12 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
     ];
   }
 
-  // FiveCalls endpoint: reps by ZIP
-  // This gives real names and usually bioguide IDs.
-  const url = `https://api.5calls.org/v1/representatives?address=${encodeURIComponent(zip)}`;
+  // 5calls expects `location` and header `X-5Calls-Token`
+  const url = `https://api.5calls.org/v1/representatives?location=${encodeURIComponent(zip)}`;
+
   const resp = await fetch(url, {
     headers: {
-      Authorization: `Token ${token}`
+      "X-5Calls-Token": token
     },
     cache: "no-store"
   });
@@ -149,17 +151,13 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
   const reps: Representative[] = (data?.representatives || [])
     .map((r: any) => {
       const chamber =
-        (r?.chamber || r?.office || "").toLowerCase().includes("senate") ? "senate" : "house";
+        String(r?.chamber || "").toLowerCase().includes("senate") ? "senate" : "house";
 
-      const bioguide =
-        r?.bioguide_id ||
-        r?.bioguideId ||
-        r?.bioguide ||
-        r?.id ||
-        "";
+      // ProPublica endpoint needs bioguide id, so prioritize it
+      const bioguide = String(r?.bioguide_id || "").trim();
 
       return {
-        id: String(bioguide || "").trim(),
+        id: bioguide || String(r?.id || "").trim(),
         name: String(r?.name || "").trim(),
         chamber,
         party: String(r?.party || "").trim(),
@@ -188,11 +186,12 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 async function getFundingVotesForMember(memberId: string): Promise<VoteItem[]> {
   const propublicaKey = process.env.PROPUBLICA_API_KEY;
 
+  // Votes won’t show unless this is set
   if (!propublicaKey || !memberId) return [];
 
-  // ProPublica member vote positions endpoint
-  // GET https://api.propublica.org/congress/v1/members/{member-id}/votes.json
-  const url = `https://api.propublica.org/congress/v1/members/${encodeURIComponent(memberId)}/votes.json`;
+  const url = `https://api.propublica.org/congress/v1/members/${encodeURIComponent(
+    memberId
+  )}/votes.json`;
 
   const resp = await fetch(url, {
     headers: {
@@ -206,6 +205,7 @@ async function getFundingVotesForMember(memberId: string): Promise<VoteItem[]> {
   const json = await resp.json();
   const votes = json?.results?.[0]?.votes || [];
 
+  // Funding-relevant only, latest 10
   const filtered = votes.filter((v: any) => isFundingRelevantVote(v)).slice(0, 10);
 
   return filtered.map((v: any) => {
@@ -232,7 +232,8 @@ async function getFundingVotesForMember(memberId: string): Promise<VoteItem[]> {
       billTitle: v?.bill?.title ? String(v.bill.title) : undefined,
       position,
       rollCall: v?.roll_call ? String(v.roll_call) : undefined,
-      result: v?.result ? String(v.result) : undefined
+      result: v?.result ? String(v.result) : undefined,
+      position
     };
   });
 }
