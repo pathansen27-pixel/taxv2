@@ -31,8 +31,6 @@ type Representative = {
   votes: VoteItem[];
 };
 
-/* ---------------- TAX LOGIC ---------------- */
-
 function estimateTax(income: number): number {
   const standardDeduction = 14000;
   const taxable = Math.max(0, income - standardDeduction);
@@ -46,8 +44,6 @@ function bucketIncome(income: number): string {
   if (income < 100000) return "60k-100k";
   return "100k+";
 }
-
-/* ---------------- BUDGET BREAKDOWN ---------------- */
 
 const BUDGET_SHARES: Array<{ code: string; name: string; share: number }> = [
   { code: "650", name: "Social Security", share: 0.24 },
@@ -64,45 +60,70 @@ function buildBreakdown(estimatedTax: number): BreakdownItem[] {
   const total = BUDGET_SHARES.reduce((sum, b) => sum + b.share, 0);
 
   return BUDGET_SHARES.map((b) => {
-    const normalizedShare = b.share / total;
+    const s = b.share / total;
     return {
       code: b.code,
       name: b.name,
-      share: Math.round(normalizedShare * 10000) / 10000,
-      amount: Math.round(estimatedTax * normalizedShare * 100) / 100
+      share: Math.round(s * 10000) / 10000,
+      amount: Math.round(estimatedTax * s * 100) / 100
     };
   });
 }
 
-/* ---------------- REPRESENTATIVES ---------------- */
+async function getRepsForZip(zip: string): Promise<{
+  reps: Representative[];
+  repsSource: "real" | "fallback";
+  repsError?: string;
+}> {
+  const token = (process.env.FIVECALLS_TOKEN || "").trim();
 
-async function getRepsForZip(zip: string): Promise<Representative[]> {
-  const token = process.env.FIVECALLS_TOKEN;
-  const url = `https://api.5calls.org/v1/representatives?address=${encodeURIComponent(zip)}`;
-
-  let resp = await fetch(url, { cache: "no-store" });
-
-  if (!resp.ok && token) {
-    resp = await fetch(url, {
-      headers: {
-        Authorization: `Token ${token}`,
-        "X-API-Key": token
-      },
-      cache: "no-store"
-    });
+  if (!token) {
+    return {
+      reps: [
+        {
+          id: "H001",
+          name: "Rep Example",
+          chamber: "house",
+          party: "D",
+          source: "fallback",
+          votes: []
+        }
+      ],
+      repsSource: "fallback",
+      repsError:
+        "Missing FIVECALLS_TOKEN on server (Vercel env var). Add it to Production and redeploy."
+    };
   }
 
+  const url = `https://api.5calls.org/v1/representatives?address=${encodeURIComponent(
+    zip
+  )}`;
+
+  const resp = await fetch(url, {
+    headers: {
+      Authorization: `Token ${token}`
+    },
+    cache: "no-store"
+  });
+
   if (!resp.ok) {
-    return [
-      {
-        id: "H001",
-        name: "Rep Example",
-        chamber: "house",
-        party: "D",
-        source: "fallback",
-        votes: []
-      }
-    ];
+    const text = await resp.text().catch(() => "");
+    return {
+      reps: [
+        {
+          id: "H001",
+          name: "Rep Example",
+          chamber: "house",
+          party: "D",
+          source: "fallback",
+          votes: []
+        }
+      ],
+      repsSource: "fallback",
+      repsError: `FiveCalls failed: ${resp.status} ${resp.statusText}${
+        text ? ` | ${text.slice(0, 200)}` : ""
+      }`
+    };
   }
 
   const data = await resp.json();
@@ -119,17 +140,17 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
         name: String(r?.name || "").trim(),
         chamber,
         party: String(r?.party || "").trim(),
-        state: r?.state,
-        district: r?.district,
+        state: r?.state ? String(r.state) : undefined,
+        district: r?.district ? String(r.district) : undefined,
         source: "real",
-        votes: [] // Voting wired in Phase 2
+        votes: []
       };
     })
-    .filter((r: Representative) => r.name);
+    .filter((x: Representative) => x.name);
 
-  return reps.length
-    ? reps
-    : [
+  if (!reps.length) {
+    return {
+      reps: [
         {
           id: "H001",
           name: "Rep Example",
@@ -138,10 +159,14 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
           source: "fallback",
           votes: []
         }
-      ];
-}
+      ],
+      repsSource: "fallback",
+      repsError: "FiveCalls returned no representatives for that ZIP/address."
+    };
+  }
 
-/* ---------------- API HANDLER ---------------- */
+  return { reps, repsSource: "real" };
+}
 
 export async function POST(req: NextRequest) {
   const body = (await req.json()) as TaxRequest;
@@ -159,13 +184,15 @@ export async function POST(req: NextRequest) {
   const incomeBucket = bucketIncome(income);
   const breakdown = buildBreakdown(estimatedTax);
 
-  const representatives = await getRepsForZip(zip);
+  const { reps, repsSource, repsError } = await getRepsForZip(zip);
 
   return NextResponse.json({
     incomeBucket,
     estimatedFederalIncomeTax: estimatedTax,
     zip,
     breakdown,
-    representatives
+    representatives: reps,
+    repsSource,
+    repsError
   });
 }
