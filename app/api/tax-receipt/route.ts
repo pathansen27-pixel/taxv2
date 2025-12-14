@@ -5,8 +5,35 @@ type TaxRequest = {
   zip: string;
 };
 
+type BreakdownItem = {
+  code: string;
+  name: string;
+  share: number;
+  amount: number;
+};
+
+type VoteItem = {
+  date: string;
+  chamber: "house" | "senate";
+  billId?: string;
+  billTitle?: string;
+  position: "Yea" | "Nay" | "Not Voting" | "Present";
+};
+
+type Representative = {
+  id: string;
+  name: string;
+  chamber: "house" | "senate";
+  party: string;
+  state?: string;
+  district?: string;
+  source: "real" | "fallback";
+  votes: VoteItem[];
+};
+
+/* ---------------- TAX LOGIC ---------------- */
+
 function estimateTax(income: number): number {
-  // Rough estimator for now
   const standardDeduction = 14000;
   const taxable = Math.max(0, income - standardDeduction);
   const rate = 0.18;
@@ -20,36 +47,8 @@ function bucketIncome(income: number): string {
   return "100k+";
 }
 
-type BreakdownItem = {
-  code: string;
-  name: string;
-  share: number; // normalized (sums to 1)
-  amount: number;
-};
+/* ---------------- BUDGET BREAKDOWN ---------------- */
 
-type VoteItem = {
-  date: string;
-  chamber: "house" | "senate";
-  billId?: string;
-  billTitle?: string;
-  description?: string;
-  position: "Yea" | "Nay" | "Not Voting" | "Present";
-  rollCall?: string;
-  result?: string;
-};
-
-type Representative = {
-  id: string; // bioguide preferred
-  name: string;
-  chamber: "house" | "senate";
-  party: string;
-  state?: string;
-  district?: string;
-  source: "real" | "fallback";
-  votes: VoteItem[];
-};
-
-// Budget categories (shares will be normalized to 1.00)
 const BUDGET_SHARES: Array<{ code: string; name: string; share: number }> = [
   { code: "650", name: "Social Security", share: 0.24 },
   { code: "570", name: "Medicare", share: 0.15 },
@@ -62,65 +61,36 @@ const BUDGET_SHARES: Array<{ code: string; name: string; share: number }> = [
 ];
 
 function buildBreakdown(estimatedTax: number): BreakdownItem[] {
-  const shareSum = BUDGET_SHARES.reduce((acc, x) => acc + x.share, 0);
-  const normalized = BUDGET_SHARES.map((x) => ({
-    ...x,
-    share: x.share / shareSum
-  }));
+  const total = BUDGET_SHARES.reduce((sum, b) => sum + b.share, 0);
 
-  return normalized.map((item) => ({
-    code: item.code,
-    name: item.name,
-    share: Math.round(item.share * 10000) / 10000,
-    amount: Math.round(estimatedTax * item.share * 100) / 100
-  }));
+  return BUDGET_SHARES.map((b) => {
+    const normalizedShare = b.share / total;
+    return {
+      code: b.code,
+      name: b.name,
+      share: Math.round(normalizedShare * 10000) / 10000,
+      amount: Math.round(estimatedTax * normalizedShare * 100) / 100
+    };
+  });
 }
+
+/* ---------------- REPRESENTATIVES ---------------- */
 
 async function getRepsForZip(zip: string): Promise<Representative[]> {
   const token = process.env.FIVECALLS_TOKEN;
-
-  // If token not set, return fallback so UI still works
-  if (!token) {
-    return [
-      {
-        id: "H001",
-        name: "Rep Example",
-        chamber: "house",
-        party: "D",
-        source: "fallback",
-        votes: []
-      },
-      {
-        id: "S001",
-        name: "Senator One",
-        chamber: "senate",
-        party: "R",
-        source: "fallback",
-        votes: []
-      },
-      {
-        id: "S002",
-        name: "Senator Two",
-        chamber: "senate",
-        party: "D",
-        source: "fallback",
-        votes: []
-      }
-    ];
-  }
-
-  // FiveCalls reps-by-address endpoint (ZIP works as an address string)
   const url = `https://api.5calls.org/v1/representatives?address=${encodeURIComponent(zip)}`;
 
-  const resp = await fetch(url, {
-    headers: {
-      // Some deployments accept Authorization, some accept X-API-Key.
-      // Sending both is safe.
-      Authorization: `Token ${token}`,
-      "X-API-Key": token
-    },
-    cache: "no-store"
-  });
+  let resp = await fetch(url, { cache: "no-store" });
+
+  if (!resp.ok && token) {
+    resp = await fetch(url, {
+      headers: {
+        Authorization: `Token ${token}`,
+        "X-API-Key": token
+      },
+      cache: "no-store"
+    });
+  }
 
   if (!resp.ok) {
     return [
@@ -144,18 +114,15 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
           ? "senate"
           : "house";
 
-      const bioguide =
-        r?.bioguide_id || r?.bioguideId || r?.bioguide || r?.id || "";
-
       return {
-        id: String(bioguide || "").trim(),
+        id: String(r?.bioguide_id || r?.id || "").trim(),
         name: String(r?.name || "").trim(),
         chamber,
         party: String(r?.party || "").trim(),
-        state: r?.state ? String(r.state) : undefined,
-        district: r?.district ? String(r.district) : undefined,
+        state: r?.state,
+        district: r?.district,
         source: "real",
-        votes: []
+        votes: [] // Voting wired in Phase 2
       };
     })
     .filter((r: Representative) => r.name);
@@ -174,16 +141,7 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
       ];
 }
 
-/**
- * Voting history step (next):
- * Congress.gov is excellent for bill metadata/status, but per-member vote positions are easiest
- * via roll-call sources (House Clerk + Senate LIS), or a dedicated votes API.
- *
- * For now we return empty votes so reps always render.
- */
-async function getVotesForMember(_memberId: string): Promise<VoteItem[]> {
-  return [];
-}
+/* ---------------- API HANDLER ---------------- */
 
 export async function POST(req: NextRequest) {
   const body = (await req.json()) as TaxRequest;
@@ -201,14 +159,7 @@ export async function POST(req: NextRequest) {
   const incomeBucket = bucketIncome(income);
   const breakdown = buildBreakdown(estimatedTax);
 
-  const reps = await getRepsForZip(zip);
-
-  const representatives: Representative[] = await Promise.all(
-    reps.map(async (r) => {
-      const votes = await getVotesForMember(r.id);
-      return { ...r, votes };
-    })
-  );
+  const representatives = await getRepsForZip(zip);
 
   return NextResponse.json({
     incomeBucket,
