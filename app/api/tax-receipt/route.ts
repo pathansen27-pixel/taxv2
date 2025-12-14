@@ -6,7 +6,7 @@ type TaxRequest = {
 };
 
 function estimateTax(income: number): number {
-  // Rough placeholder. Replace later with real brackets.
+  // Rough estimator for now
   const standardDeduction = 14000;
   const taxable = Math.max(0, income - standardDeduction);
   const rate = 0.18;
@@ -23,8 +23,8 @@ function bucketIncome(income: number): string {
 type BreakdownItem = {
   code: string;
   name: string;
-  share: number; // 0..1
-  amount: number; // dollars
+  share: number; // normalized (sums to 1)
+  amount: number;
 };
 
 type VoteItem = {
@@ -32,12 +32,10 @@ type VoteItem = {
   chamber: "house" | "senate";
   billId?: string;
   billTitle?: string;
-  question?: string;
   description?: string;
   position: "Yea" | "Nay" | "Not Voting" | "Present";
   rollCall?: string;
   result?: string;
-  source: "congress" | "fallback";
 };
 
 type Representative = {
@@ -51,6 +49,7 @@ type Representative = {
   votes: VoteItem[];
 };
 
+// Budget categories (shares will be normalized to 1.00)
 const BUDGET_SHARES: Array<{ code: string; name: string; share: number }> = [
   { code: "650", name: "Social Security", share: 0.24 },
   { code: "570", name: "Medicare", share: 0.15 },
@@ -63,7 +62,6 @@ const BUDGET_SHARES: Array<{ code: string; name: string; share: number }> = [
 ];
 
 function buildBreakdown(estimatedTax: number): BreakdownItem[] {
-  // Normalize shares so they sum to 1.00 even if we tweak later
   const shareSum = BUDGET_SHARES.reduce((acc, x) => acc + x.share, 0);
   const normalized = BUDGET_SHARES.map((x) => ({
     ...x,
@@ -78,47 +76,10 @@ function buildBreakdown(estimatedTax: number): BreakdownItem[] {
   }));
 }
 
-function isFundingRelevantText(text: string): boolean {
-  const t = text.toLowerCase();
-
-  // “money-moving” keywords
-  const keywords = [
-    "appropriation",
-    "appropriations",
-    "continuing resolution",
-    "continuing appropriations",
-    "budget",
-    "spending",
-    "funding",
-    "authorization",
-    "supplemental"
-  ];
-
-  const hasKeyword = keywords.some((k) => t.includes(k));
-
-  // “vote type” cues (kept tight)
-  const isPassageish =
-    t.includes("on passage") ||
-    t.includes("passage") ||
-    t.includes("conference report") ||
-    t.includes("cloture") ||
-    t.includes("motion to proceed") ||
-    t.includes("motion");
-
-  return hasKeyword && isPassageish;
-}
-
-function toPosition(raw: string): VoteItem["position"] {
-  const r = (raw || "").trim().toLowerCase();
-  if (r === "yes" || r === "yea") return "Yea";
-  if (r === "no" || r === "nay") return "Nay";
-  if (r === "present") return "Present";
-  return "Not Voting";
-}
-
 async function getRepsForZip(zip: string): Promise<Representative[]> {
   const token = process.env.FIVECALLS_TOKEN;
 
+  // If token not set, return fallback so UI still works
   if (!token) {
     return [
       {
@@ -128,15 +89,36 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
         party: "D",
         source: "fallback",
         votes: []
+      },
+      {
+        id: "S001",
+        name: "Senator One",
+        chamber: "senate",
+        party: "R",
+        source: "fallback",
+        votes: []
+      },
+      {
+        id: "S002",
+        name: "Senator Two",
+        chamber: "senate",
+        party: "D",
+        source: "fallback",
+        votes: []
       }
     ];
   }
 
-  // FiveCalls: reps by address/zip
+  // FiveCalls reps-by-address endpoint (ZIP works as an address string)
   const url = `https://api.5calls.org/v1/representatives?address=${encodeURIComponent(zip)}`;
 
   const resp = await fetch(url, {
-    headers: { Authorization: `Token ${token}` },
+    headers: {
+      // Some deployments accept Authorization, some accept X-API-Key.
+      // Sending both is safe.
+      Authorization: `Token ${token}`,
+      "X-API-Key": token
+    },
     cache: "no-store"
   });
 
@@ -157,15 +139,13 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 
   const reps: Representative[] = (data?.representatives || [])
     .map((r: any) => {
-      const chamberText = String(r?.chamber || r?.office || "").toLowerCase();
-      const chamber: "house" | "senate" = chamberText.includes("senate") ? "senate" : "house";
+      const chamber =
+        (r?.chamber || r?.office || "").toLowerCase().includes("senate")
+          ? "senate"
+          : "house";
 
       const bioguide =
-        r?.bioguide_id ||
-        r?.bioguideId ||
-        r?.bioguide ||
-        r?.id ||
-        "";
+        r?.bioguide_id || r?.bioguideId || r?.bioguide || r?.id || "";
 
       return {
         id: String(bioguide || "").trim(),
@@ -195,74 +175,14 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 }
 
 /**
- * Congress.gov API (api.data.gov key)
- * Notes:
- * - Congress.gov API responses vary by endpoint.
- * - This function is defensive: if the endpoint shape is different, it returns [] instead of breaking the app.
+ * Voting history step (next):
+ * Congress.gov is excellent for bill metadata/status, but per-member vote positions are easiest
+ * via roll-call sources (House Clerk + Senate LIS), or a dedicated votes API.
+ *
+ * For now we return empty votes so reps always render.
  */
-async function getFundingVotesForMember(memberId: string): Promise<VoteItem[]> {
-  const congressKey = process.env.CONGRESS_GOV_API_KEY;
-
-  if (!congressKey || !memberId) return [];
-
-  // This is the most likely pattern people use for Congress.gov API.
-  // If this endpoint 404s in your logs, we will switch to the correct one for the API’s vote data structure.
-  const url = `https://api.congress.gov/v3/member/${encodeURIComponent(
-    memberId
-  )}/votes?format=json&api_key=${encodeURIComponent(congressKey)}`;
-
-  const resp = await fetch(url, { cache: "no-store" });
-  if (!resp.ok) return [];
-
-  const json = await resp.json();
-
-  // Try a few common shapes defensively
-  const rawVotes =
-    json?.votes ||
-    json?.results?.votes ||
-    json?.results?.[0]?.votes ||
-    json?.memberVotes ||
-    [];
-
-  if (!Array.isArray(rawVotes)) return [];
-
-  const mapped: VoteItem[] = rawVotes
-    .map((v: any) => {
-      const chamberText = String(v?.chamber || v?.vote_chamber || "").toLowerCase();
-      const chamber: "house" | "senate" = chamberText.includes("senate") ? "senate" : "house";
-
-      const billId = v?.bill?.bill_id || v?.billId || v?.bill_id;
-      const billTitle = v?.bill?.title || v?.billTitle || v?.bill_title;
-
-      const question = v?.question || v?.vote_question;
-      const description = v?.description || v?.vote_description;
-
-      const combinedText = `${billTitle || ""} ${description || ""} ${question || ""}`.trim();
-      if (!combinedText) return null;
-
-      const position = toPosition(String(v?.position || v?.vote_position || ""));
-
-      return {
-        date: String(v?.date || v?.vote_date || ""),
-        chamber,
-        billId: billId ? String(billId) : undefined,
-        billTitle: billTitle ? String(billTitle) : undefined,
-        question: question ? String(question) : undefined,
-        description: description ? String(description) : undefined,
-        position,
-        rollCall: v?.roll_call ? String(v.roll_call) : v?.rollCall ? String(v.rollCall) : undefined,
-        result: v?.result ? String(v.result) : undefined,
-        source: "congress" as const
-      };
-    })
-    .filter(Boolean) as VoteItem[];
-
-  // Funding-relevant filter + cap (Phase 1)
-  const filtered = mapped
-    .filter((v) => isFundingRelevantText(`${v.billTitle || ""} ${v.description || ""} ${v.question || ""}`))
-    .slice(0, 10);
-
-  return filtered;
+async function getVotesForMember(_memberId: string): Promise<VoteItem[]> {
+  return [];
 }
 
 export async function POST(req: NextRequest) {
@@ -271,7 +191,10 @@ export async function POST(req: NextRequest) {
   const zip = String(body.zip || "").trim();
 
   if (!income || !zip) {
-    return NextResponse.json({ error: "income and zip are required" }, { status: 400 });
+    return NextResponse.json(
+      { error: "income and zip are required" },
+      { status: 400 }
+    );
   }
 
   const estimatedTax = estimateTax(income);
@@ -282,7 +205,7 @@ export async function POST(req: NextRequest) {
 
   const representatives: Representative[] = await Promise.all(
     reps.map(async (r) => {
-      const votes = await getFundingVotesForMember(r.id);
+      const votes = await getVotesForMember(r.id);
       return { ...r, votes };
     })
   );
