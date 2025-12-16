@@ -95,9 +95,7 @@ async function getRepsForZip(zip: string): Promise<{
     };
   }
 
-  const url = `https://api.5calls.org/v1/representatives?address=${encodeURIComponent(
-    zip
-  )}`;
+  const url = `https://api.5calls.org/v1/representatives?location=${encodeURIComponent(zip)}`;
 
   const resp = await fetch(url, {
     headers: {
