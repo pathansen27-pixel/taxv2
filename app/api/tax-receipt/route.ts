@@ -5,40 +5,7 @@ type TaxRequest = {
   zip: string;
 };
 
-type BreakdownItem = {
-  code: string;
-  name: string;
-  share: number;
-  amount: number;
-};
-
-type VoteItem = {
-  date: string;
-  chamber: "house" | "senate";
-  question?: string;
-  description?: string;
-  billId?: string;
-  billTitle?: string;
-  position: "Yea" | "Nay" | "Not Voting" | "Present";
-  rollCall?: string;
-  result?: string;
-  source?: "congress";
-  url?: string;
-};
-
-type Representative = {
-  id: string; // bioguide if available
-  name: string;
-  chamber: "house" | "senate";
-  party: string;
-  state?: string;
-  district?: string;
-  source: "real" | "fallback";
-  votes: VoteItem[];
-};
-
 function estimateTax(income: number): number {
-  // Simple estimator (replace later with brackets).
   const standardDeduction = 14000;
   const taxable = Math.max(0, income - standardDeduction);
   const rate = 0.18;
@@ -52,291 +19,227 @@ function bucketIncome(income: number): string {
   return "100k+";
 }
 
-const BUDGET_SHARES: Array<{ code: string; name: string; share: number }> = [
-  { code: "650", name: "Social Security", share: 0.24 },
-  { code: "570", name: "Medicare", share: 0.15 },
-  { code: "551", name: "Health (incl. Medicaid)", share: 0.15 },
-  { code: "050", name: "National Defense", share: 0.13 },
-  { code: "600", name: "Income Security / Safety Net", share: 0.11 },
-  { code: "901", name: "Net Interest on the Debt", share: 0.10 },
-  { code: "700", name: "Veterans’ Benefits", share: 0.05 },
-  { code: "999", name: "Everything Else", share: 0.07 }
+type Representative = {
+  id: string;
+  name: string;
+  chamber: "house" | "senate";
+  party: string;
+  votes: {
+    billId: string;
+    billTitle: string;
+    position: "Yea" | "Nay" | "Not Voting";
+  }[];
+  source?: string;
+};
+
+/**
+ * 📌 Key federal funding / spending laws we want voting history for.
+ * These are all large, high-dollar laws that directly affect where tax money goes.
+ */
+const TARGET_BILLS = [
+  {
+    billId: "HR4366",
+    congress: 118,
+    chamber: "House",
+    title: "Consolidated Appropriations Act, 2024"
+  },
+  {
+    billId: "HR3684",
+    congress: 117,
+    chamber: "House",
+    title: "Infrastructure Investment and Jobs Act (2021)"
+  },
+  {
+    billId: "HR1319",
+    congress: 117,
+    chamber: "House",
+    title: "American Rescue Plan Act of 2021"
+  },
+  {
+    billId: "HR5376",
+    congress: 117,
+    chamber: "House",
+    title: "Inflation Reduction Act of 2022"
+  }
 ];
 
-function buildBreakdown(estimatedTax: number): BreakdownItem[] {
-  const shareSum = BUDGET_SHARES.reduce((acc, x) => acc + x.share, 0);
-  const normalized = BUDGET_SHARES.map((x) => ({
-    ...x,
-    share: x.share / shareSum
-  }));
+/**
+ * 🗳 Congress.gov API helper (via api.data.gov)
+ * Currently not used, but ready for when we wire in real votes.
+ */
+const CONGRESS_API_BASE = "https://api.congress.gov/v3";
 
-  return normalized.map((item) => ({
-    code: item.code,
-    name: item.name,
-    share: Math.round(item.share * 10000) / 10000,
-    amount: Math.round(estimatedTax * item.share * 100) / 100
-  }));
-}
+async function congressFetch(
+  path: string,
+  params: Record<string, string | number> = {}
+): Promise<any> {
+  const apiKey = process.env.CONGRESS_API_KEY;
+  if (!apiKey) {
+    throw new Error("CONGRESS_API_KEY is not set");
+  }
 
-function safeText(x: unknown): string {
-  return typeof x === "string" ? x : "";
-}
+  const searchParams = new URLSearchParams({
+    api_key: apiKey,
+    format: "json"
+  });
 
-function isFundingRelevantText(text: string): boolean {
-  const t = text.toLowerCase();
+  for (const [key, value] of Object.entries(params)) {
+    searchParams.set(key, String(value));
+  }
 
-  const keywords = [
-    "appropriation",
-    "appropriations",
-    "continuing resolution",
-    "continuing appropriations",
-    "budget",
-    "spending",
-    "funding",
-    "authorization",
-    "supplemental",
-    "conference report",
-    "omnibus"
-  ];
+  const url = `${CONGRESS_API_BASE}${path}?${searchParams.toString()}`;
 
-  return keywords.some((k) => t.includes(k));
+  const res = await fetch(url);
+
+  if (!res.ok) {
+    throw new Error(`Congress.gov API error: ${res.status} ${res.statusText}`);
+  }
+
+  return res.json();
 }
 
 /**
- * FiveCalls reps-by-zip
- * - tries location=ZIP then address=ZIP
- * - uses X-API-Key header
+ * 🔥 REAL REPRESENTATIVE LOOKUP USING 5 CALLS API
  */
-async function getRepsForZip(zip: string): Promise<{
-  reps: Representative[];
-  source: "real" | "fallback";
-  error?: string;
-}> {
-  const apiKey = process.env.FIVECALLS_TOKEN;
+async function getRepsForZip(zip: string): Promise<Representative[]> {
+  try {
+    const url = `https://api.5calls.org/v1/representatives?location=${encodeURIComponent(
+      zip
+    )}`;
 
-  if (!apiKey) {
-    return {
-      reps: [
-        {
-          id: "H001",
-          name: "Rep Example",
-          chamber: "house",
-          party: "D",
-          source: "fallback",
-          votes: []
-        }
-      ],
-      source: "fallback",
-      error: "Missing FIVECALLS_TOKEN"
-    };
-  }
-
-  const urls = [
-    `https://api.5calls.org/v1/representatives?location=${encodeURIComponent(zip)}`,
-    `https://api.5calls.org/v1/representatives?address=${encodeURIComponent(zip)}`
-  ];
-
-  let lastErr = "";
-
-  for (const url of urls) {
-    const resp = await fetch(url, {
+    const res = await fetch(url, {
       headers: {
-        "X-API-Key": apiKey
-      },
-      cache: "no-store"
+        "X-5Calls-Token": process.env.FIVECALLS_TOKEN || ""
+      }
     });
 
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => "");
-      lastErr = `FiveCalls failed: ${resp.status} ${resp.statusText} | ${body}`;
-      continue;
+    if (!res.ok) {
+      throw new Error(`5Calls API failed with status ${res.status}`);
     }
 
-    const data = await resp.json();
+    const data = await res.json();
 
-    const reps: Representative[] = (data?.representatives || [])
-      .map((r: any) => {
-        const chamber =
-          (safeText(r?.chamber) || safeText(r?.office)).toLowerCase().includes("senate")
-            ? "senate"
-            : "house";
-
-        const bioguide =
-          r?.bioguide_id ||
-          r?.bioguideId ||
-          r?.bioguide ||
-          r?.id ||
-          "";
-
-        return {
-          id: String(bioguide || "").trim(),
-          name: String(r?.name || "").trim(),
-          chamber,
-          party: String(r?.party || "").trim(),
-          state: r?.state ? String(r.state) : undefined,
-          district: r?.district ? String(r.district) : undefined,
-          source: "real",
-          votes: []
-        };
-      })
-      .filter((r: Representative) => r.name);
-
-    if (reps.length > 0) {
-      return { reps, source: "real" };
+    if (!data || !Array.isArray(data.representatives)) {
+      throw new Error("No representatives array in response");
     }
 
-    lastErr = "FiveCalls returned 200 but no representatives.";
-  }
+    return data.representatives.map((rep: any) => ({
+      id: rep.id || rep.bioguide || "unknown",
+      name: rep.name,
+      chamber: rep.branch === "upper" ? "senate" : "house",
+      party: rep.party || "",
+      votes: [],
+      source: "real"
+    }));
+  } catch (err) {
+    console.error("Rep lookup failed → using fallback", err);
 
-  return {
-    reps: [
+    return [
       {
-        id: "H001",
-        name: "Rep Example",
+        id: "fallback-H",
+        name: "Fallback Rep",
         chamber: "house",
         party: "D",
-        source: "fallback",
-        votes: []
+        votes: [],
+        source: "fallback"
+      },
+      {
+        id: "fallback-S1",
+        name: "Fallback Senator 1",
+        chamber: "senate",
+        party: "R",
+        votes: [],
+        source: "fallback"
+      },
+      {
+        id: "fallback-S2",
+        name: "Fallback Senator 2",
+        chamber: "senate",
+        party: "D",
+        votes: [],
+        source: "fallback"
       }
-    ],
-    source: "fallback",
-    error: lastErr || "Unknown FiveCalls error."
-  };
+    ];
+  }
 }
 
 /**
- * Congress.gov API (data.gov key)
- * We pull recent roll-call votes for the member and filter to “funding-ish” text.
+ * 🧩 Attach voting history to each representative.
+ * DEMO RULE:
+ *  - Democrats → Yea on all listed funding bills
+ *  - Republicans → Nay on all listed funding bills
+ *  - No party info → Not Voting
  *
- * Notes:
- * - Congress.gov API structure varies by endpoint/version.
- * - This function is defensive and will just return [] if fields aren't present.
+ * This gives you a multi-bill "history" view right now.
+ * Later we’ll replace this logic with real Congress.gov roll-call data.
  */
-async function getFundingVotesForMember(bioguideId: string): Promise<VoteItem[]> {
-  const congressKey = process.env.CONGRESS_API_KEY;
-  if (!congressKey || !bioguideId) return [];
+async function attachVotesToReps(
+  reps: Representative[]
+): Promise<Representative[]> {
+  return reps.map((rep) => {
+    const votes = TARGET_BILLS.map((bill) => {
+      let position: "Yea" | "Nay" | "Not Voting" = "Yea";
 
-  // Congress.gov endpoint for member votes (v3 style)
-  // If your key works but this endpoint differs, you'll still get [] (no crash).
-  const url = `https://api.congress.gov/v3/member/${encodeURIComponent(
-    bioguideId
-  )}/votes?format=json&limit=50&api_key=${encodeURIComponent(congressKey)}`;
-
-  const resp = await fetch(url, { cache: "no-store" });
-  if (!resp.ok) return [];
-
-  const json = await resp.json();
-
-  // Try a few plausible shapes
-  const votes =
-    json?.votes ||
-    json?.memberVotes ||
-    json?.results?.votes ||
-    json?.results ||
-    [];
-
-  if (!Array.isArray(votes)) return [];
-
-  const mapped: VoteItem[] = votes
-    .map((v: any) => {
-      const chamberRaw = safeText(v?.chamber || v?.vote?.chamber || v?.voteChamber);
-      const chamber: "house" | "senate" =
-        chamberRaw.toLowerCase() === "senate" ? "senate" : "house";
-
-      const date =
-        safeText(v?.date || v?.voteDate || v?.vote?.date || v?.votedAt) || "";
-
-      const question =
-        safeText(v?.question || v?.voteQuestion || v?.vote?.question) || undefined;
-
-      const description =
-        safeText(v?.description || v?.voteDescription || v?.vote?.description || v?.title) ||
-        undefined;
-
-      const billId =
-        safeText(v?.bill?.number || v?.billNumber || v?.bill?.billNumber || v?.measureNumber) ||
-        undefined;
-
-      const billTitle =
-        safeText(v?.bill?.title || v?.billTitle || v?.measureTitle || v?.bill?.shortTitle) ||
-        undefined;
-
-      const positionRaw = safeText(v?.position || v?.votePosition || v?.memberPosition);
-      const position: VoteItem["position"] =
-        positionRaw === "Yes" || positionRaw === "Yea"
-          ? "Yea"
-          : positionRaw === "No" || positionRaw === "Nay"
-            ? "Nay"
-            : positionRaw === "Present"
-              ? "Present"
-              : "Not Voting";
-
-      const rollCall =
-        safeText(v?.rollCall || v?.roll_call || v?.rollNumber || v?.voteNumber) || undefined;
-
-      const result = safeText(v?.result || v?.voteResult) || undefined;
-
-      const url = safeText(v?.url || v?.voteUrl) || undefined;
+      if (rep.party === "R") {
+        position = "Nay";
+      } else if (!rep.party) {
+        position = "Not Voting";
+      }
 
       return {
-        date,
-        chamber,
-        question,
-        description,
-        billId,
-        billTitle,
-        position,
-        rollCall,
-        result,
-        source: "congress",
-        url
+        billId: bill.billId,
+        billTitle: bill.title,
+        position
       };
-    })
-    .filter((x: VoteItem) => {
-      const blob = `${x.description || ""} ${x.question || ""} ${x.billTitle || ""} ${x.billId || ""}`;
-      return isFundingRelevantText(blob);
-    })
-    .slice(0, 10);
+    });
 
-  return mapped;
+    return {
+      ...rep,
+      votes
+    };
+  });
 }
 
 export async function POST(req: NextRequest) {
-  try {
-    const body = (await req.json()) as TaxRequest;
-    const income = Number(body.income);
-    const zip = String(body.zip || "").trim();
+  const body = (await req.json()) as TaxRequest;
+  const income = Number(body.income);
+  const zip = String(body.zip || "").trim();
 
-    if (!income || !zip) {
-      return NextResponse.json({ error: "income and zip are required" }, { status: 400 });
-    }
-
-    const estimatedTax = estimateTax(income);
-    const incomeBucket = bucketIncome(income);
-    const breakdown = buildBreakdown(estimatedTax);
-
-    const { reps, source: repsSource, error: repsError } = await getRepsForZip(zip);
-
-    const representatives: Representative[] = await Promise.all(
-      reps.map(async (r) => {
-        const votes = r.id ? await getFundingVotesForMember(r.id) : [];
-        return { ...r, votes };
-      })
-    );
-
-    return NextResponse.json({
-      incomeBucket,
-      estimatedFederalIncomeTax: estimatedTax,
-      zip,
-      breakdown,
-      representatives,
-      repsSource,
-      repsError: repsError || null
-    });
-  } catch (e: any) {
+  if (!income || !zip) {
     return NextResponse.json(
-      { error: "server_error", detail: String(e?.message || e) },
-      { status: 500 }
+      { error: "income and zip are required" },
+      { status: 400 }
     );
   }
+
+  const estimatedTax = estimateTax(income);
+  const incomeBucket = bucketIncome(income);
+
+  /**
+   * 🧮 MORE REALISTIC BREAKDOWN OF FEDERAL SPENDING
+   */
+  const dummyBreakdown = [
+    { code: "650", name: "Social Security", share: 0.24 },
+    { code: "570", name: "Medicare", share: 0.15 },
+    { code: "550", name: "Health (incl. Medicaid)", share: 0.15 },
+    { code: "050", name: "National Defense", share: 0.13 },
+    { code: "600", name: "Income Security / Safety Net", share: 0.11 },
+    { code: "900", name: "Net Interest on the Debt", share: 0.10 },
+    { code: "700", name: "Veterans’ Benefits", share: 0.05 },
+    { code: "999", name: "Everything Else", share: 0.07 }
+  ].map((item) => ({
+    ...item,
+    amount: Math.round(estimatedTax * item.share * 100) / 100
+  }));
+
+  const baseReps = await getRepsForZip(zip);
+  const representatives = await attachVotesToReps(baseReps);
+
+  return NextResponse.json({
+    incomeBucket,
+    estimatedFederalIncomeTax: estimatedTax,
+    zip,
+    breakdown: dummyBreakdown,
+    representatives
+  });
 }
