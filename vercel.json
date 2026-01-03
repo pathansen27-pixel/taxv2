@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/refresh-votes",
+      "schedule": "0 6 * * *"
+    }
+  ]
+}
