@@ -3,6 +3,11 @@ import { NextRequest, NextResponse } from "next/server";
 type TaxRequest = {
   income: number;
   zip: string;
+  /**
+   * Optional: when true, returns a step-by-step trace the UI can render
+   * without changing any calculation behavior.
+   */
+  includeAccountability?: boolean;
 };
 
 function estimateTax(income: number): number {
@@ -30,6 +35,39 @@ type Representative = {
     position: "Yea" | "Nay" | "Not Voting";
   }[];
   source?: string;
+};
+
+/**
+ * Accountability structures returned to the UI.
+ * This adds transparency without changing how anything is calculated.
+ */
+type AccountabilityValueSource = "user_input" | "assumption" | "derived";
+
+type AccountabilityAssumption = {
+  key: string;
+  label: string;
+  value: number | string;
+  source: AccountabilityValueSource;
+};
+
+type AccountabilityStep = {
+  id: string;
+  label: string;
+  formula?: string;
+  inputs?: Record<string, number | string>;
+  output?: number | string;
+  source: AccountabilityValueSource;
+};
+
+type AccountabilityPayload = {
+  inputs: {
+    income: number;
+    zip: string;
+    incomeBucket: string;
+  };
+  assumptions: AccountabilityAssumption[];
+  steps: AccountabilityStep[];
+  notes: string[];
 };
 
 /**
@@ -200,12 +238,101 @@ async function attachVotesToReps(
   });
 }
 
+/**
+ * Builds the accountability payload for the UI.
+ * Important: This does NOT change estimateTax(). It mirrors the same math
+ * so the UI can show intermediate values and assumptions.
+ */
+function buildAccountability(
+  income: number,
+  zip: string,
+  incomeBucket: string,
+  estimatedTax: number
+): AccountabilityPayload {
+  const standardDeduction = 14000;
+  const rate = 0.18;
+
+  const taxableIncome = Math.max(0, income - standardDeduction);
+  const rawTax = taxableIncome * rate;
+  const roundedTax = Math.round(rawTax);
+
+  return {
+    inputs: {
+      income,
+      zip,
+      incomeBucket
+    },
+    assumptions: [
+      {
+        key: "standardDeduction",
+        label: "Standard deduction",
+        value: standardDeduction,
+        source: "assumption"
+      },
+      {
+        key: "rate",
+        label: "Flat rate",
+        value: rate,
+        source: "assumption"
+      },
+      {
+        key: "rounding",
+        label: "Rounding",
+        value: "Nearest whole dollar (Math.round)",
+        source: "assumption"
+      }
+    ],
+    steps: [
+      {
+        id: "bucketIncome",
+        label: "Income bucket",
+        formula:
+          'if income < 35000 => "0-35k"; < 60000 => "35k-60k"; < 100000 => "60k-100k"; else "100k+"',
+        inputs: { income },
+        output: incomeBucket,
+        source: "derived"
+      },
+      {
+        id: "taxableIncome",
+        label: "Taxable income",
+        formula: "max(0, income - standardDeduction)",
+        inputs: { income, standardDeduction },
+        output: taxableIncome,
+        source: "derived"
+      },
+      {
+        id: "rawTax",
+        label: "Raw tax before rounding",
+        formula: "taxableIncome * rate",
+        inputs: { taxableIncome, rate },
+        output: Math.round(rawTax * 100) / 100,
+        source: "derived"
+      },
+      {
+        id: "roundedTax",
+        label: "Estimated tax (rounded)",
+        formula: "round(rawTax)",
+        inputs: { rawTax },
+        output: roundedTax,
+        source: "derived"
+      }
+    ],
+    notes: [
+      "This is a simplified estimate, not tax filing advice.",
+      "This endpoint returns an explainability trace so the UI can show how the estimate was produced."
+    ]
+  };
+}
+
 export async function POST(req: NextRequest) {
   const body = (await req.json()) as TaxRequest;
+
   const income = Number(body.income);
   const zip = String(body.zip || "").trim();
+  const includeAccountability = Boolean(body.includeAccountability);
 
-  if (!income || !zip) {
+  // Keep behavior strict and avoid NaN issues
+  if (!Number.isFinite(income) || income <= 0 || !zip) {
     return NextResponse.json(
       { error: "income and zip are required" },
       { status: 400 }
@@ -235,11 +362,16 @@ export async function POST(req: NextRequest) {
   const baseReps = await getRepsForZip(zip);
   const representatives = await attachVotesToReps(baseReps);
 
+  const accountability = includeAccountability
+    ? buildAccountability(income, zip, incomeBucket, estimatedTax)
+    : null;
+
   return NextResponse.json({
     incomeBucket,
     estimatedFederalIncomeTax: estimatedTax,
     zip,
     breakdown: dummyBreakdown,
-    representatives
+    representatives,
+    accountability
   });
 }
