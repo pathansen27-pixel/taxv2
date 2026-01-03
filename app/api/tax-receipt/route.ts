@@ -46,7 +46,7 @@ function bucketIncome(income: number): string {
    Bill Index (EXPAND THIS FREELY)
 ======================= */
 
-const TARGET_BILLS = [
+const TARGET_BILLS: Array<{ billId: string; congress: number; title: string }> = [
   { billId: "HR4366", congress: 118, title: "Consolidated Appropriations Act, 2024" },
   { billId: "HR5376", congress: 117, title: "Inflation Reduction Act of 2022" },
   { billId: "HR3684", congress: 117, title: "Infrastructure Investment and Jobs Act" },
@@ -70,7 +70,7 @@ async function congressFetch(path: string): Promise<any> {
   return res.json();
 }
 
-function parseBillId(billId: string) {
+function parseBillId(billId: string): { type: string; number: string } {
   const match = billId.match(/^([A-Za-z]+)(\d+)$/);
   if (!match) throw new Error(`Invalid billId: ${billId}`);
   return { type: match[1].toLowerCase(), number: match[2] };
@@ -83,11 +83,12 @@ function parseBillId(billId: string) {
 async function getVoteUrl(billId: string, congress: number): Promise<string | null> {
   const { type, number } = parseBillId(billId);
   const data = await congressFetch(`/bill/${congress}/${type}/${number}`);
-  const actions = data?.bill?.actions || [];
+  const actions: any[] = data?.bill?.actions || [];
 
   for (const a of actions) {
-    if (a.recordedVotes?.length) {
-      return a.recordedVotes[0].url;
+    if (Array.isArray(a?.recordedVotes) && a.recordedVotes.length) {
+      const url = a.recordedVotes[0]?.url;
+      if (typeof url === "string" && url.length) return url;
     }
   }
   return null;
@@ -95,49 +96,65 @@ async function getVoteUrl(billId: string, congress: number): Promise<string | nu
 
 async function fetchVoteXml(url: string): Promise<string> {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Vote XML fetch failed`);
+  if (!res.ok) throw new Error(`Vote XML fetch failed: ${res.status}`);
   return res.text();
 }
 
 function parseVotesFromXml(xml: string): Map<string, VotePosition> {
   const map = new Map<string, VotePosition>();
-  const members = xml.split(/<member>|<voter>/i).slice(1);
 
-  for (const m of members) {
+  // Split on common voter/member tags across House/Senate XML variants
+  const chunks = xml.split(/<member\b|<voter\b/i).slice(1);
+
+  for (const chunk of chunks) {
     const bioguide =
-      m.match(/bioguide_id="([^"]+)"/i)?.[1] ||
-      m.match(/<bioguide[^>]*>([^<]+)</i)?.[1];
+      chunk.match(/bioguide_id="([^"]+)"/i)?.[1] ||
+      chunk.match(/<bioguide[^>]*>([^<]+)</i)?.[1];
 
     if (!bioguide) continue;
 
-    const vote =
-      m.match(/<vote[^>]*>([^<]+)</i)?.[1]?.toLowerCase() || "";
+    const raw =
+      chunk.match(/<vote[^>]*>([^<]+)</i)?.[1] ||
+      chunk.match(/vote="([^"]+)"/i)?.[1] ||
+      "";
+
+    const vote = raw.trim().toLowerCase();
 
     let position: VotePosition = "Not Voting";
-    if (["yea", "aye", "yes"].includes(vote)) position = "Yea";
-    if (["nay", "no"].includes(vote)) position = "Nay";
+    if (["yea", "aye", "yes", "y"].includes(vote)) position = "Yea";
+    if (["nay", "no", "n"].includes(vote)) position = "Nay";
 
     map.set(bioguide.toUpperCase(), position);
   }
+
   return map;
 }
 
 /* =======================
-   Representatives (ZIP → REAL PEOPLE)
+   Representatives (ZIP → REAL PEOPLE via 5Calls)
 ======================= */
 
 async function getRepsForZip(zip: string): Promise<Representative[]> {
   const res = await fetch(
-    `https://api.5calls.org/v1/representatives?location=${zip}`,
+    `https://api.5calls.org/v1/representatives?location=${encodeURIComponent(zip)}`,
     { headers: { "X-5Calls-Token": process.env.FIVECALLS_TOKEN || "" } }
   );
 
+  if (!res.ok) {
+    throw new Error(`5Calls API failed with status ${res.status}`);
+  }
+
   const data = await res.json();
+
+  if (!data || !Array.isArray(data.representatives)) {
+    throw new Error("No representatives array in 5Calls response");
+  }
+
   return data.representatives.map((r: any) => ({
-    id: r.bioguide,
+    id: r.bioguide || r.id || "unknown",
     name: r.name,
     chamber: r.branch === "upper" ? "senate" : "house",
-    party: r.party,
+    party: r.party || "",
     votes: [],
     source: "real"
   }));
@@ -148,7 +165,10 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 ======================= */
 
 async function attachVotesToReps(reps: Representative[]): Promise<Representative[]> {
-  const billVotes = [];
+  const billVotes: Array<{
+    bill: { billId: string; congress: number; title: string };
+    votes: Map<string, VotePosition>;
+  }> = [];
 
   for (const bill of TARGET_BILLS) {
     try {
@@ -159,19 +179,24 @@ async function attachVotesToReps(reps: Representative[]): Promise<Representative
       const votes = parseVotesFromXml(xml);
 
       billVotes.push({ bill, votes });
-    } catch {
+    } catch (e) {
+      console.error(`Failed live vote fetch for ${bill.billId}`, e);
       continue;
     }
   }
 
-  return reps.map((rep) => ({
-    ...rep,
-    votes: billVotes.map(({ bill, votes }) => ({
-      billId: bill.billId,
-      billTitle: bill.title,
-      position: votes.get(rep.id.toUpperCase()) || "Not Voting"
-    }))
-  }));
+  return reps.map((rep) => {
+    const repKey = String(rep.id || "").toUpperCase();
+
+    return {
+      ...rep,
+      votes: billVotes.map(({ bill, votes }) => ({
+        billId: bill.billId,
+        billTitle: bill.title,
+        position: votes.get(repKey) || "Not Voting"
+      }))
+    };
+  });
 }
 
 /* =======================
@@ -183,25 +208,28 @@ export async function POST(req: NextRequest) {
   const income = Number(body.income);
   const zip = String(body.zip || "").trim();
 
-  if (!income || !zip) {
-    return NextResponse.json({ error: "income and zip required" }, { status: 400 });
+  if (!Number.isFinite(income) || income <= 0 || !zip) {
+    return NextResponse.json(
+      { error: "income and zip are required" },
+      { status: 400 }
+    );
   }
 
   const estimatedTax = estimateTax(income);
   const incomeBucket = bucketIncome(income);
 
   const breakdown = [
-    { name: "Social Security", share: 0.24 },
-    { name: "Medicare", share: 0.15 },
-    { name: "Health", share: 0.15 },
-    { name: "Defense", share: 0.13 },
-    { name: "Safety Net", share: 0.11 },
-    { name: "Interest", share: 0.10 },
-    { name: "Veterans", share: 0.05 },
-    { name: "Other", share: 0.07 }
-  ].map((b) => ({
-    ...b,
-    amount: Math.round(estimatedTax * b.share * 100) / 100
+    { code: "650", name: "Social Security", share: 0.24 },
+    { code: "570", name: "Medicare", share: 0.15 },
+    { code: "550", name: "Health (incl. Medicaid)", share: 0.15 },
+    { code: "050", name: "National Defense", share: 0.13 },
+    { code: "600", name: "Income Security / Safety Net", share: 0.11 },
+    { code: "900", name: "Net Interest on the Debt", share: 0.1 },
+    { code: "700", name: "Veterans’ Benefits", share: 0.05 },
+    { code: "999", name: "Everything Else", share: 0.07 }
+  ].map((item) => ({
+    ...item,
+    amount: Math.round(estimatedTax * item.share * 100) / 100
   }));
 
   const reps = await getRepsForZip(zip);
