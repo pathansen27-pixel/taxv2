@@ -11,6 +11,12 @@ type TaxRequest = {
 
 type VotePosition = "Yea" | "Nay" | "Not Voting";
 
+type BillIndexItem = {
+  billId: string;
+  congress: number;
+  title: string;
+};
+
 type Representative = {
   id: string; // BioGuide ID
   name: string;
@@ -43,15 +49,32 @@ function bucketIncome(income: number): string {
 }
 
 /* =======================
-   Bill Index (EXPAND THIS FREELY)
+   Bill Index (EXPAND THIS)
+   Important: votes will only appear for bills with recorded vote URLs.
 ======================= */
 
-const TARGET_BILLS: Array<{ billId: string; congress: number; title: string }> = [
+const TARGET_BILLS: BillIndexItem[] = [
+  // Big recent fiscal and spending packages
   { billId: "HR4366", congress: 118, title: "Consolidated Appropriations Act, 2024" },
-  { billId: "HR5376", congress: 117, title: "Inflation Reduction Act of 2022" },
+  { billId: "HR2617", congress: 118, title: "Consolidated Appropriations Act, 2023 (various divisions)" },
+  { billId: "HR2617", congress: 117, title: "Consolidated Appropriations Act, 2022" },
+
+  // Infrastructure and recovery
   { billId: "HR3684", congress: 117, title: "Infrastructure Investment and Jobs Act" },
   { billId: "HR1319", congress: 117, title: "American Rescue Plan Act" },
-  { billId: "S1", congress: 118, title: "Federal Budget Resolution" }
+
+  // Climate, tax, and energy
+  { billId: "HR5376", congress: 117, title: "Inflation Reduction Act" },
+
+  // Defense (often has clear roll calls)
+  { billId: "HR2670", congress: 118, title: "National Defense Authorization Act (FY2024)" },
+  { billId: "HR2670", congress: 117, title: "National Defense Authorization Act (FY2023)" },
+
+  // Debt and fiscal mechanics (often voted)
+  { billId: "HR3746", congress: 118, title: "Fiscal Responsibility Act (debt limit, 2023)" },
+
+  // Selected supplemental funding (often voted)
+  { billId: "HR815", congress: 118, title: "National Security Supplemental (various, 2024)" }
 ];
 
 /* =======================
@@ -82,15 +105,19 @@ function parseBillId(billId: string): { type: string; number: string } {
 
 async function getVoteUrl(billId: string, congress: number): Promise<string | null> {
   const { type, number } = parseBillId(billId);
+
+  // Congress.gov bill endpoint: /bill/{congress}/{billType}/{billNumber}
   const data = await congressFetch(`/bill/${congress}/${type}/${number}`);
   const actions: any[] = data?.bill?.actions || [];
 
+  // Recorded votes are often on actions, take the first available.
   for (const a of actions) {
     if (Array.isArray(a?.recordedVotes) && a.recordedVotes.length) {
       const url = a.recordedVotes[0]?.url;
       if (typeof url === "string" && url.length) return url;
     }
   }
+
   return null;
 }
 
@@ -131,7 +158,7 @@ function parseVotesFromXml(xml: string): Map<string, VotePosition> {
 }
 
 /* =======================
-   Representatives (ZIP → REAL PEOPLE via 5Calls)
+   Representatives (ZIP via 5Calls)
 ======================= */
 
 async function getRepsForZip(zip: string): Promise<Representative[]> {
@@ -140,12 +167,9 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
     { headers: { "X-5Calls-Token": process.env.FIVECALLS_TOKEN || "" } }
   );
 
-  if (!res.ok) {
-    throw new Error(`5Calls API failed with status ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`5Calls API failed with status ${res.status}`);
 
   const data = await res.json();
-
   if (!data || !Array.isArray(data.representatives)) {
     throw new Error("No representatives array in 5Calls response");
   }
@@ -161,42 +185,64 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 }
 
 /* =======================
-   Attach REAL Votes
+   Attach LIVE Votes
 ======================= */
 
-async function attachVotesToReps(reps: Representative[]): Promise<Representative[]> {
+async function attachVotesToReps(
+  reps: Representative[]
+): Promise<{
+  representatives: Representative[];
+  billsIndexed: Array<BillIndexItem & { voteUrlFound: boolean }>;
+}> {
   const billVotes: Array<{
-    bill: { billId: string; congress: number; title: string };
-    votes: Map<string, VotePosition>;
+    bill: BillIndexItem;
+    voteUrl: string | null;
+    votes: Map<string, VotePosition> | null;
   }> = [];
 
   for (const bill of TARGET_BILLS) {
     try {
-      const url = await getVoteUrl(bill.billId, bill.congress);
-      if (!url) continue;
+      const voteUrl = await getVoteUrl(bill.billId, bill.congress);
 
-      const xml = await fetchVoteXml(url);
+      if (!voteUrl) {
+        billVotes.push({ bill, voteUrl: null, votes: null });
+        continue;
+      }
+
+      const xml = await fetchVoteXml(voteUrl);
       const votes = parseVotesFromXml(xml);
 
-      billVotes.push({ bill, votes });
+      billVotes.push({ bill, voteUrl, votes });
     } catch (e) {
       console.error(`Failed live vote fetch for ${bill.billId}`, e);
-      continue;
+      billVotes.push({ bill, voteUrl: null, votes: null });
     }
   }
 
-  return reps.map((rep) => {
+  const billsIndexed = billVotes.map((b) => ({
+    ...b.bill,
+    voteUrlFound: Boolean(b.voteUrl)
+  }));
+
+  const representatives = reps.map((rep) => {
     const repKey = String(rep.id || "").toUpperCase();
 
     return {
       ...rep,
-      votes: billVotes.map(({ bill, votes }) => ({
-        billId: bill.billId,
-        billTitle: bill.title,
-        position: votes.get(repKey) || "Not Voting"
-      }))
+      votes: billVotes.map((bv) => {
+        const position: VotePosition =
+          bv.votes?.get(repKey) || "Not Voting";
+
+        return {
+          billId: bv.bill.billId,
+          billTitle: bv.bill.title,
+          position
+        };
+      })
     };
   });
+
+  return { representatives, billsIndexed };
 }
 
 /* =======================
@@ -233,13 +279,14 @@ export async function POST(req: NextRequest) {
   }));
 
   const reps = await getRepsForZip(zip);
-  const representatives = await attachVotesToReps(reps);
+  const { representatives, billsIndexed } = await attachVotesToReps(reps);
 
   return NextResponse.json({
     incomeBucket,
     estimatedFederalIncomeTax: estimatedTax,
     zip,
     breakdown,
+    billsIndexed,
     representatives
   });
 }
