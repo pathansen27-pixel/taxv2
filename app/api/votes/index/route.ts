@@ -22,13 +22,16 @@ export async function GET(req: NextRequest) {
     limit ${limit};
   `;
 
-  const billIds = bills.rows.map((r: any) => Number(r.id)).filter((n: number) => Number.isFinite(n));
+  const billIds = bills.rows
+    .map((r: any) => Number(r.id))
+    .filter((n: number) => Number.isFinite(n));
 
   let rollCallsByBill: Record<string, any[]> = {};
 
   if (billIds.length) {
-    // IMPORTANT: sql.array is the correct way to pass arrays into @vercel/postgres tagged templates
-    const rc = await sql`
+    // Build a safe parameterized IN (...) list without sql.array
+    const placeholders = billIds.map((_, i) => `$${i + 1}`).join(", ");
+    const query = `
       select
         brc.bill_id,
         rc.id as roll_call_id,
@@ -45,9 +48,11 @@ export async function GET(req: NextRequest) {
       from bill_roll_calls brc
       join roll_calls rc on rc.id = brc.roll_call_id
       left join roll_call_stats rcs on rcs.roll_call_id = rc.id
-      where brc.bill_id = any(${sql.array(billIds, "bigint")})
+      where brc.bill_id in (${placeholders})
       order by rc.vote_date desc nulls last;
     `;
+
+    const rc = await sql.query(query, billIds);
 
     rollCallsByBill = {};
     rc.rows.forEach((row: any) => {
