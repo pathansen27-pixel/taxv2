@@ -9,7 +9,7 @@ type TaxRequest = {
   zip: string;
 };
 
-type VotePosition = "Yea" | "Nay" | "Not Voting";
+type VotePosition = "Yea" | "Nay" | "Not Voting" | "No Roll Call Found";
 
 type BillIndexItem = {
   billId: string;
@@ -18,7 +18,7 @@ type BillIndexItem = {
 };
 
 type Representative = {
-  id: string; // BioGuide ID
+  id: string; // BioGuide ID (best effort)
   name: string;
   chamber: "house" | "senate";
   party: string;
@@ -50,30 +50,16 @@ function bucketIncome(income: number): string {
 
 /* =======================
    Bill Index (EXPAND THIS)
-   Important: votes will only appear for bills with recorded vote URLs.
+   Note: many “Acts” are umbrellas. Some will not have a clean single roll call.
 ======================= */
 
 const TARGET_BILLS: BillIndexItem[] = [
-  // Big recent fiscal and spending packages
   { billId: "HR4366", congress: 118, title: "Consolidated Appropriations Act, 2024" },
-  { billId: "HR2617", congress: 118, title: "Consolidated Appropriations Act, 2023 (various divisions)" },
-  { billId: "HR2617", congress: 117, title: "Consolidated Appropriations Act, 2022" },
-
-  // Infrastructure and recovery
   { billId: "HR3684", congress: 117, title: "Infrastructure Investment and Jobs Act" },
   { billId: "HR1319", congress: 117, title: "American Rescue Plan Act" },
-
-  // Climate, tax, and energy
   { billId: "HR5376", congress: 117, title: "Inflation Reduction Act" },
-
-  // Defense (often has clear roll calls)
-  { billId: "HR2670", congress: 118, title: "National Defense Authorization Act (FY2024)" },
-  { billId: "HR2670", congress: 117, title: "National Defense Authorization Act (FY2023)" },
-
-  // Debt and fiscal mechanics (often voted)
   { billId: "HR3746", congress: 118, title: "Fiscal Responsibility Act (debt limit, 2023)" },
-
-  // Selected supplemental funding (often voted)
+  { billId: "HR2670", congress: 118, title: "National Defense Authorization Act (FY2024)" },
   { billId: "HR815", congress: 118, title: "National Security Supplemental (various, 2024)" }
 ];
 
@@ -89,7 +75,11 @@ async function congressFetch(path: string): Promise<any> {
 
   const url = `${CONGRESS_API_BASE}${path}?api_key=${apiKey}&format=json`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Congress API failed: ${res.status}`);
+
+  if (!res.ok) {
+    throw new Error(`Congress API failed: ${res.status} ${res.statusText}`);
+  }
+
   return res.json();
 }
 
@@ -100,19 +90,20 @@ function parseBillId(billId: string): { type: string; number: string } {
 }
 
 /* =======================
-   Roll Call Vote Fetching
+   Vote URL selection
+
+   Important: a bill can have multiple recorded votes across amendments, motions, passage.
+   We take the first recorded vote we can find, but we also expose "voteUrlFound" so UI can show truth.
 ======================= */
 
 async function getVoteUrl(billId: string, congress: number): Promise<string | null> {
   const { type, number } = parseBillId(billId);
-
-  // Congress.gov bill endpoint: /bill/{congress}/{billType}/{billNumber}
   const data = await congressFetch(`/bill/${congress}/${type}/${number}`);
-  const actions: any[] = data?.bill?.actions || [];
 
-  // Recorded votes are often on actions, take the first available.
+  const actions: any[] = data?.bill?.actions || [];
   for (const a of actions) {
     if (Array.isArray(a?.recordedVotes) && a.recordedVotes.length) {
+      // Prefer the first URL. Later you can add smarter selection by action text.
       const url = a.recordedVotes[0]?.url;
       if (typeof url === "string" && url.length) return url;
     }
@@ -121,18 +112,29 @@ async function getVoteUrl(billId: string, congress: number): Promise<string | nu
   return null;
 }
 
-async function fetchVoteXml(url: string): Promise<string> {
+/* =======================
+   Vote fetching and parsing
+
+   Reality: recorded vote URLs may point to XML, JSON, or an HTML page.
+   We do best-effort parsing:
+   - If XML: parse for bioguide_id or <bioguide>
+   - If JSON: attempt common vote member shapes
+   - Otherwise: no votes
+======================= */
+
+async function fetchVoteContent(url: string): Promise<{ contentType: string; body: string }> {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Vote XML fetch failed: ${res.status}`);
-  return res.text();
+  if (!res.ok) throw new Error(`Vote fetch failed: ${res.status} ${res.statusText}`);
+
+  const contentType = res.headers.get("content-type") || "";
+  const body = await res.text();
+  return { contentType, body };
 }
 
 function parseVotesFromXml(xml: string): Map<string, VotePosition> {
   const map = new Map<string, VotePosition>();
 
-  // Split on common voter/member tags across House/Senate XML variants
   const chunks = xml.split(/<member\b|<voter\b/i).slice(1);
-
   for (const chunk of chunks) {
     const bioguide =
       chunk.match(/bioguide_id="([^"]+)"/i)?.[1] ||
@@ -145,11 +147,12 @@ function parseVotesFromXml(xml: string): Map<string, VotePosition> {
       chunk.match(/vote="([^"]+)"/i)?.[1] ||
       "";
 
-    const vote = raw.trim().toLowerCase();
+    const v = raw.trim().toLowerCase();
 
     let position: VotePosition = "Not Voting";
-    if (["yea", "aye", "yes", "y"].includes(vote)) position = "Yea";
-    if (["nay", "no", "n"].includes(vote)) position = "Nay";
+    if (["yea", "aye", "yes", "y"].includes(v)) position = "Yea";
+    if (["nay", "no", "n"].includes(v)) position = "Nay";
+    if (["not voting", "absent", "present"].includes(v)) position = "Not Voting";
 
     map.set(bioguide.toUpperCase(), position);
   }
@@ -157,8 +160,63 @@ function parseVotesFromXml(xml: string): Map<string, VotePosition> {
   return map;
 }
 
+function parseVotesFromJson(jsonText: string): Map<string, VotePosition> {
+  const map = new Map<string, VotePosition>();
+
+  let data: any;
+  try {
+    data = JSON.parse(jsonText);
+  } catch {
+    return map;
+  }
+
+  // Try a few likely shapes without assuming too much
+  const candidates: any[] =
+    data?.vote?.members ||
+    data?.members ||
+    data?.rollCallVote?.members ||
+    data?.roll_call_vote?.members ||
+    [];
+
+  if (!Array.isArray(candidates)) return map;
+
+  for (const m of candidates) {
+    const bioguide =
+      (m?.bioguideId || m?.bioguide_id || m?.bioguide || m?.member?.bioguideId || "").toString();
+
+    if (!bioguide) continue;
+
+    const raw =
+      (m?.vote || m?.position || m?.castVote || m?.cast_vote || "").toString().trim().toLowerCase();
+
+    let position: VotePosition = "Not Voting";
+    if (["yea", "aye", "yes", "y"].includes(raw)) position = "Yea";
+    if (["nay", "no", "n"].includes(raw)) position = "Nay";
+    if (["not voting", "absent", "present"].includes(raw)) position = "Not Voting";
+
+    map.set(bioguide.toUpperCase(), position);
+  }
+
+  return map;
+}
+
+async function buildVoteMapFromUrl(url: string): Promise<Map<string, VotePosition>> {
+  const { contentType, body } = await fetchVoteContent(url);
+
+  if (contentType.includes("xml") || body.trim().startsWith("<?xml") || body.includes("<rollcall")) {
+    return parseVotesFromXml(body);
+  }
+
+  if (contentType.includes("json") || body.trim().startsWith("{") || body.trim().startsWith("[")) {
+    return parseVotesFromJson(body);
+  }
+
+  // HTML or unknown: cannot parse votes
+  return new Map<string, VotePosition>();
+}
+
 /* =======================
-   Representatives (ZIP via 5Calls)
+   Representatives via 5Calls
 ======================= */
 
 async function getRepsForZip(zip: string): Promise<Representative[]> {
@@ -167,15 +225,19 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
     { headers: { "X-5Calls-Token": process.env.FIVECALLS_TOKEN || "" } }
   );
 
-  if (!res.ok) throw new Error(`5Calls API failed with status ${res.status}`);
+  if (!res.ok) {
+    throw new Error(`5Calls API failed with status ${res.status}`);
+  }
 
   const data = await res.json();
+
   if (!data || !Array.isArray(data.representatives)) {
     throw new Error("No representatives array in 5Calls response");
   }
 
   return data.representatives.map((r: any) => ({
-    id: r.bioguide || r.id || "unknown",
+    // 5Calls sometimes uses bioguide, bioguide_id, or id depending on upstream
+    id: (r.bioguide || r.bioguide_id || r.id || "unknown").toString(),
     name: r.name,
     chamber: r.branch === "upper" ? "senate" : "house",
     party: r.party || "",
@@ -185,19 +247,19 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 }
 
 /* =======================
-   Attach LIVE Votes
+   Attach LIVE Votes (with honest fallback)
 ======================= */
 
 async function attachVotesToReps(
   reps: Representative[]
 ): Promise<{
   representatives: Representative[];
-  billsIndexed: Array<BillIndexItem & { voteUrlFound: boolean }>;
+  billsIndexed: Array<BillIndexItem & { voteUrlFound: boolean; votesParsed: boolean }>;
 }> {
   const billVotes: Array<{
     bill: BillIndexItem;
     voteUrl: string | null;
-    votes: Map<string, VotePosition> | null;
+    voteMap: Map<string, VotePosition> | null;
   }> = [];
 
   for (const bill of TARGET_BILLS) {
@@ -205,23 +267,23 @@ async function attachVotesToReps(
       const voteUrl = await getVoteUrl(bill.billId, bill.congress);
 
       if (!voteUrl) {
-        billVotes.push({ bill, voteUrl: null, votes: null });
+        billVotes.push({ bill, voteUrl: null, voteMap: null });
         continue;
       }
 
-      const xml = await fetchVoteXml(voteUrl);
-      const votes = parseVotesFromXml(xml);
+      const voteMap = await buildVoteMapFromUrl(voteUrl);
 
-      billVotes.push({ bill, voteUrl, votes });
+      billVotes.push({ bill, voteUrl, voteMap });
     } catch (e) {
-      console.error(`Failed live vote fetch for ${bill.billId}`, e);
-      billVotes.push({ bill, voteUrl: null, votes: null });
+      console.error(`Vote fetch failed for ${bill.billId}`, e);
+      billVotes.push({ bill, voteUrl: null, voteMap: null });
     }
   }
 
-  const billsIndexed = billVotes.map((b) => ({
-    ...b.bill,
-    voteUrlFound: Boolean(b.voteUrl)
+  const billsIndexed = billVotes.map((bv) => ({
+    ...bv.bill,
+    voteUrlFound: Boolean(bv.voteUrl),
+    votesParsed: Boolean(bv.voteMap && bv.voteMap.size > 0)
   }));
 
   const representatives = reps.map((rep) => {
@@ -230,8 +292,18 @@ async function attachVotesToReps(
     return {
       ...rep,
       votes: billVotes.map((bv) => {
-        const position: VotePosition =
-          bv.votes?.get(repKey) || "Not Voting";
+        // Honest labeling:
+        // - If no vote URL or no parseable votes: "No Roll Call Found"
+        // - If we have votes but this member is absent: "Not Voting"
+        if (!bv.voteUrl || !bv.voteMap || bv.voteMap.size === 0) {
+          return {
+            billId: bv.bill.billId,
+            billTitle: bv.bill.title,
+            position: "No Roll Call Found" as VotePosition
+          };
+        }
+
+        const position = bv.voteMap.get(repKey) || "Not Voting";
 
         return {
           billId: bv.bill.billId,
