@@ -17,6 +17,36 @@ type BillIndexItem = {
   title: string;
 };
 
+type VoteStats = {
+  total: number;
+  yea: number;
+  nay: number;
+  notVoting: number;
+  margin: number; // abs(yea - nay)
+};
+
+type BillIndexEntry = BillIndexItem & {
+  billType: string;
+  billNumber: string;
+  policyArea?: string | null;
+  sponsors?: string[];
+  latestAction?: string | null;
+  summary?: string | null;
+  recordedVote: {
+    voteUrlFound: boolean;
+    voteUrl?: string | null;
+    votesParsed: boolean;
+    stats?: VoteStats | null;
+  };
+  analysis: {
+    highlights: string[];
+    pros: string[];
+    cons: string[];
+    controversy: string[];
+    methodology: string; // short disclosure string
+  };
+};
+
 type Representative = {
   id: string; // BioGuide ID (best effort)
   name: string;
@@ -50,7 +80,6 @@ function bucketIncome(income: number): string {
 
 /* =======================
    Bill Index (EXPAND THIS)
-   Note: many “Acts” are umbrellas. Some will not have a clean single roll call.
 ======================= */
 
 const TARGET_BILLS: BillIndexItem[] = [
@@ -83,28 +112,89 @@ async function congressFetch(path: string): Promise<any> {
   return res.json();
 }
 
-function parseBillId(billId: string): { type: string; number: string } {
+function parseBillId(billId: string): { billType: string; billNumber: string } {
   const match = billId.match(/^([A-Za-z]+)(\d+)$/);
   if (!match) throw new Error(`Invalid billId: ${billId}`);
-  return { type: match[1].toLowerCase(), number: match[2] };
+  return { billType: match[1].toLowerCase(), billNumber: match[2] };
+}
+
+/**
+ * Pulls a bill record and extracts a stable subset used for the index.
+ * The Congress.gov response shape varies a bit by endpoint versioning,
+ * so this is intentionally defensive.
+ */
+async function getBillMeta(billId: string, congress: number): Promise<{
+  policyArea: string | null;
+  sponsors: string[];
+  latestAction: string | null;
+  summary: string | null;
+  actions: any[];
+}> {
+  const { billType, billNumber } = parseBillId(billId);
+  const data = await congressFetch(`/bill/${congress}/${billType}/${billNumber}`);
+
+  const bill = data?.bill || data;
+
+  const policyArea =
+    bill?.policyArea?.name ??
+    bill?.policyArea ??
+    bill?.policy_area?.name ??
+    null;
+
+  const sponsors: string[] = [];
+  const sponsor = bill?.sponsors?.[0] || bill?.sponsor;
+  if (sponsor?.fullName) sponsors.push(String(sponsor.fullName));
+  if (sponsor?.name && sponsors.length === 0) sponsors.push(String(sponsor.name));
+
+  const latestAction =
+    bill?.latestAction?.text ??
+    bill?.latest_action?.text ??
+    bill?.latestAction ??
+    null;
+
+  // Congress.gov often includes one or more summaries (frequently CRS)
+  const summaries = bill?.summaries || bill?.summaries?.summaries || [];
+  let summary: string | null = null;
+
+  if (Array.isArray(summaries) && summaries.length) {
+    // Prefer the first summary text we find
+    const s0 = summaries[0];
+    summary = (s0?.text || s0?.summaryText || s0?.content || null) as string | null;
+  } else if (bill?.summary?.text) {
+    summary = String(bill.summary.text);
+  }
+
+  const actions: any[] = Array.isArray(bill?.actions) ? bill.actions : [];
+
+  return {
+    policyArea: policyArea ? String(policyArea) : null,
+    sponsors,
+    latestAction: latestAction ? String(latestAction) : null,
+    summary: summary ? String(summary) : null,
+    actions
+  };
 }
 
 /* =======================
-   Vote URL selection
-
-   Important: a bill can have multiple recorded votes across amendments, motions, passage.
-   We take the first recorded vote we can find, but we also expose "voteUrlFound" so UI can show truth.
+   Recorded vote URL selection
 ======================= */
 
-async function getVoteUrl(billId: string, congress: number): Promise<string | null> {
-  const { type, number } = parseBillId(billId);
-  const data = await congressFetch(`/bill/${congress}/${type}/${number}`);
+async function getVoteUrlFromActions(
+  billId: string,
+  congress: number,
+  actions: any[]
+): Promise<string | null> {
+  // If actions passed in, use them. Else fetch bill meta and use its actions.
+  let localActions = actions;
+  if (!Array.isArray(localActions) || !localActions.length) {
+    const meta = await getBillMeta(billId, congress);
+    localActions = meta.actions;
+  }
 
-  const actions: any[] = data?.bill?.actions || [];
-  for (const a of actions) {
-    if (Array.isArray(a?.recordedVotes) && a.recordedVotes.length) {
-      // Prefer the first URL. Later you can add smarter selection by action text.
-      const url = a.recordedVotes[0]?.url;
+  for (const a of localActions) {
+    const recordedVotes = a?.recordedVotes || a?.recorded_votes || [];
+    if (Array.isArray(recordedVotes) && recordedVotes.length) {
+      const url = recordedVotes[0]?.url;
       if (typeof url === "string" && url.length) return url;
     }
   }
@@ -114,18 +204,11 @@ async function getVoteUrl(billId: string, congress: number): Promise<string | nu
 
 /* =======================
    Vote fetching and parsing
-
-   Reality: recorded vote URLs may point to XML, JSON, or an HTML page.
-   We do best-effort parsing:
-   - If XML: parse for bioguide_id or <bioguide>
-   - If JSON: attempt common vote member shapes
-   - Otherwise: no votes
 ======================= */
 
 async function fetchVoteContent(url: string): Promise<{ contentType: string; body: string }> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Vote fetch failed: ${res.status} ${res.statusText}`);
-
   const contentType = res.headers.get("content-type") || "";
   const body = await res.text();
   return { contentType, body };
@@ -170,20 +253,18 @@ function parseVotesFromJson(jsonText: string): Map<string, VotePosition> {
     return map;
   }
 
-  // Try a few likely shapes without assuming too much
-  const candidates: any[] =
+  const members: any[] =
     data?.vote?.members ||
     data?.members ||
     data?.rollCallVote?.members ||
     data?.roll_call_vote?.members ||
     [];
 
-  if (!Array.isArray(candidates)) return map;
+  if (!Array.isArray(members)) return map;
 
-  for (const m of candidates) {
+  for (const m of members) {
     const bioguide =
       (m?.bioguideId || m?.bioguide_id || m?.bioguide || m?.member?.bioguideId || "").toString();
-
     if (!bioguide) continue;
 
     const raw =
@@ -203,16 +284,37 @@ function parseVotesFromJson(jsonText: string): Map<string, VotePosition> {
 async function buildVoteMapFromUrl(url: string): Promise<Map<string, VotePosition>> {
   const { contentType, body } = await fetchVoteContent(url);
 
-  if (contentType.includes("xml") || body.trim().startsWith("<?xml") || body.includes("<rollcall")) {
+  const trimmed = body.trim();
+
+  if (
+    contentType.includes("xml") ||
+    trimmed.startsWith("<?xml") ||
+    trimmed.startsWith("<") ||
+    trimmed.toLowerCase().includes("<rollcall")
+  ) {
     return parseVotesFromXml(body);
   }
 
-  if (contentType.includes("json") || body.trim().startsWith("{") || body.trim().startsWith("[")) {
+  if (contentType.includes("json") || trimmed.startsWith("{") || trimmed.startsWith("[")) {
     return parseVotesFromJson(body);
   }
 
-  // HTML or unknown: cannot parse votes
   return new Map<string, VotePosition>();
+}
+
+function computeVoteStats(voteMap: Map<string, VotePosition>): VoteStats {
+  let yea = 0;
+  let nay = 0;
+  let notVoting = 0;
+
+  for (const v of voteMap.values()) {
+    if (v === "Yea") yea += 1;
+    else if (v === "Nay") nay += 1;
+    else notVoting += 1;
+  }
+
+  const total = yea + nay + notVoting;
+  return { total, yea, nay, notVoting, margin: Math.abs(yea - nay) };
 }
 
 /* =======================
@@ -225,18 +327,14 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
     { headers: { "X-5Calls-Token": process.env.FIVECALLS_TOKEN || "" } }
   );
 
-  if (!res.ok) {
-    throw new Error(`5Calls API failed with status ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`5Calls API failed with status ${res.status}`);
 
   const data = await res.json();
-
   if (!data || !Array.isArray(data.representatives)) {
     throw new Error("No representatives array in 5Calls response");
   }
 
   return data.representatives.map((r: any) => ({
-    // 5Calls sometimes uses bioguide, bioguide_id, or id depending on upstream
     id: (r.bioguide || r.bioguide_id || r.id || "unknown").toString(),
     name: r.name,
     chamber: r.branch === "upper" ? "senate" : "house",
@@ -247,74 +345,207 @@ async function getRepsForZip(zip: string): Promise<Representative[]> {
 }
 
 /* =======================
-   Attach LIVE Votes (with honest fallback)
+   Analysis generation (unbiased, data grounded)
+
+   Discipline:
+   - We do not claim "good" or "bad"
+   - We only produce:
+     - highlights: what it does, who it affects, what it changes (from summary)
+     - pros: plausible intended benefits (tied to summary text)
+     - cons: plausible tradeoffs/risks (scope, cost, complexity) without asserting facts we do not have
+     - controversy: vote margin and missing roll call signals
 ======================= */
 
-async function attachVotesToReps(
-  reps: Representative[]
-): Promise<{
-  representatives: Representative[];
-  billsIndexed: Array<BillIndexItem & { voteUrlFound: boolean; votesParsed: boolean }>;
+function sentenceSplit(text: string, max = 4): string[] {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned) return [];
+  const parts = cleaned.split(/(?<=[.?!])\s+/).filter(Boolean);
+  return parts.slice(0, max);
+}
+
+function buildBillAnalysis(args: {
+  title: string;
+  policyArea: string | null;
+  summary: string | null;
+  latestAction: string | null;
+  recordedVote: { voteUrlFound: boolean; votesParsed: boolean; stats?: VoteStats | null };
+}): BillIndexEntry["analysis"] {
+  const { title, policyArea, summary, latestAction, recordedVote } = args;
+
+  const highlights: string[] = [];
+  const pros: string[] = [];
+  const cons: string[] = [];
+  const controversy: string[] = [];
+
+  if (policyArea) highlights.push(`Policy area: ${policyArea}.`);
+  if (latestAction) highlights.push(`Latest action: ${latestAction}.`);
+
+  const summaryLines = summary ? sentenceSplit(summary, 4) : [];
+  if (summaryLines.length) {
+    highlights.push(...summaryLines.map((s) => s.endsWith(".") ? s : `${s}.`));
+    pros.push("Intended benefits align with the bill’s stated objectives in the official summary.");
+    cons.push("Tradeoffs depend on implementation details, scope, and budget effects not captured in a short summary.");
+  } else {
+    highlights.push("No official summary text was available from the data source for this bill.");
+    pros.push("Supporters typically argue the bill advances its stated purpose or addresses a defined problem.");
+    cons.push("Opponents typically argue about cost, scope, unintended consequences, or implementation risk.");
+  }
+
+  if (recordedVote.voteUrlFound && recordedVote.votesParsed && recordedVote.stats) {
+    const s = recordedVote.stats;
+    controversy.push(`Recorded vote observed. Yea: ${s.yea}, Nay: ${s.nay}, Not voting: ${s.notVoting}.`);
+    if (s.margin <= 10) {
+      controversy.push("Close vote margin suggests a more contested issue among voting members.");
+    } else {
+      controversy.push("Larger vote margin suggests broader agreement among voting members on the specific roll call captured.");
+    }
+  } else if (recordedVote.voteUrlFound && !recordedVote.votesParsed) {
+    controversy.push("A recorded vote link exists, but votes could not be parsed from the content format returned.");
+  } else {
+    controversy.push("No recorded roll-call vote link was found for the bill actions captured, so vote attribution is unavailable here.");
+  }
+
+  return {
+    highlights,
+    pros,
+    cons,
+    controversy,
+    methodology:
+      "Highlights and summary are sourced from bill metadata and summaries when available. Pros, cons, and controversy notes are generated as neutral context and vote statistics when roll-call data is available."
+  };
+}
+
+/* =======================
+   Build the bill index with metadata + votes
+======================= */
+
+async function buildBillIndex(): Promise<{
+  billIndex: BillIndexEntry[];
+  billVoteMaps: Array<{
+    billId: string;
+    billTitle: string;
+    voteUrl: string | null;
+    voteMap: Map<string, VotePosition> | null;
+  }>;
 }> {
-  const billVotes: Array<{
-    bill: BillIndexItem;
+  const billIndex: BillIndexEntry[] = [];
+  const billVoteMaps: Array<{
+    billId: string;
+    billTitle: string;
     voteUrl: string | null;
     voteMap: Map<string, VotePosition> | null;
   }> = [];
 
-  for (const bill of TARGET_BILLS) {
+  for (const b of TARGET_BILLS) {
+    const { billType, billNumber } = parseBillId(b.billId);
+
+    let policyArea: string | null = null;
+    let sponsors: string[] = [];
+    let latestAction: string | null = null;
+    let summary: string | null = null;
+    let actions: any[] = [];
+
     try {
-      const voteUrl = await getVoteUrl(bill.billId, bill.congress);
-
-      if (!voteUrl) {
-        billVotes.push({ bill, voteUrl: null, voteMap: null });
-        continue;
-      }
-
-      const voteMap = await buildVoteMapFromUrl(voteUrl);
-
-      billVotes.push({ bill, voteUrl, voteMap });
+      const meta = await getBillMeta(b.billId, b.congress);
+      policyArea = meta.policyArea;
+      sponsors = meta.sponsors;
+      latestAction = meta.latestAction;
+      summary = meta.summary;
+      actions = meta.actions;
     } catch (e) {
-      console.error(`Vote fetch failed for ${bill.billId}`, e);
-      billVotes.push({ bill, voteUrl: null, voteMap: null });
+      // Keep entry, but note missing metadata
+      policyArea = null;
+      sponsors = [];
+      latestAction = null;
+      summary = null;
+      actions = [];
     }
+
+    let voteUrl: string | null = null;
+    let voteMap: Map<string, VotePosition> | null = null;
+    let votesParsed = false;
+    let stats: VoteStats | null = null;
+
+    try {
+      voteUrl = await getVoteUrlFromActions(b.billId, b.congress, actions);
+      if (voteUrl) {
+        voteMap = await buildVoteMapFromUrl(voteUrl);
+        votesParsed = voteMap.size > 0;
+        stats = votesParsed ? computeVoteStats(voteMap) : null;
+      }
+    } catch {
+      voteUrl = null;
+      voteMap = null;
+      votesParsed = false;
+      stats = null;
+    }
+
+    const analysis = buildBillAnalysis({
+      title: b.title,
+      policyArea,
+      summary,
+      latestAction,
+      recordedVote: { voteUrlFound: Boolean(voteUrl), votesParsed, stats }
+    });
+
+    billIndex.push({
+      ...b,
+      billType,
+      billNumber,
+      policyArea,
+      sponsors,
+      latestAction,
+      summary,
+      recordedVote: {
+        voteUrlFound: Boolean(voteUrl),
+        voteUrl: voteUrl || null,
+        votesParsed,
+        stats
+      },
+      analysis
+    });
+
+    billVoteMaps.push({
+      billId: b.billId,
+      billTitle: b.title,
+      voteUrl: voteUrl || null,
+      voteMap
+    });
   }
 
-  const billsIndexed = billVotes.map((bv) => ({
-    ...bv.bill,
-    voteUrlFound: Boolean(bv.voteUrl),
-    votesParsed: Boolean(bv.voteMap && bv.voteMap.size > 0)
-  }));
+  return { billIndex, billVoteMaps };
+}
 
-  const representatives = reps.map((rep) => {
+/* =======================
+   Attach votes to reps, but do not lie
+======================= */
+
+function attachVotesToRepsFromMaps(
+  reps: Representative[],
+  billVoteMaps: Array<{
+    billId: string;
+    billTitle: string;
+    voteUrl: string | null;
+    voteMap: Map<string, VotePosition> | null;
+  }>
+): Representative[] {
+  return reps.map((rep) => {
     const repKey = String(rep.id || "").toUpperCase();
 
     return {
       ...rep,
-      votes: billVotes.map((bv) => {
-        // Honest labeling:
-        // - If no vote URL or no parseable votes: "No Roll Call Found"
-        // - If we have votes but this member is absent: "Not Voting"
+      votes: billVoteMaps.map((bv) => {
         if (!bv.voteUrl || !bv.voteMap || bv.voteMap.size === 0) {
-          return {
-            billId: bv.bill.billId,
-            billTitle: bv.bill.title,
-            position: "No Roll Call Found" as VotePosition
-          };
+          return { billId: bv.billId, billTitle: bv.billTitle, position: "No Roll Call Found" };
         }
-
-        const position = bv.voteMap.get(repKey) || "Not Voting";
-
         return {
-          billId: bv.bill.billId,
-          billTitle: bv.bill.title,
-          position
+          billId: bv.billId,
+          billTitle: bv.billTitle,
+          position: bv.voteMap.get(repKey) || "Not Voting"
         };
       })
     };
   });
-
-  return { representatives, billsIndexed };
 }
 
 /* =======================
@@ -327,10 +558,7 @@ export async function POST(req: NextRequest) {
   const zip = String(body.zip || "").trim();
 
   if (!Number.isFinite(income) || income <= 0 || !zip) {
-    return NextResponse.json(
-      { error: "income and zip are required" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "income and zip are required" }, { status: 400 });
   }
 
   const estimatedTax = estimateTax(income);
@@ -351,14 +579,17 @@ export async function POST(req: NextRequest) {
   }));
 
   const reps = await getRepsForZip(zip);
-  const { representatives, billsIndexed } = await attachVotesToReps(reps);
+
+  // Build the bill index and vote maps once, then reuse it
+  const { billIndex, billVoteMaps } = await buildBillIndex();
+  const representatives = attachVotesToRepsFromMaps(reps, billVoteMaps);
 
   return NextResponse.json({
     incomeBucket,
     estimatedFederalIncomeTax: estimatedTax,
     zip,
     breakdown,
-    billsIndexed,
+    billIndex,
     representatives
   });
 }
