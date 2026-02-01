@@ -1,588 +1,296 @@
-"use client";
+'use client';
 
-import { useState } from "react";
+import { useState } from 'react';
 
-type BillSummary = {
-  billId: string;
-  title: string;
-  shortName: string;
-  year: number;
+interface TaxResult {
+  salary: number;
+  filingStatus: string;
+  incomeTax: number;
+  ficaTax: number;
+  totalFederalTax: number;
+  effectiveRate: number;
+  takeHome: number;
+}
+
+interface BudgetBreakdown {
   category: string;
+  percentage: number;
+  amount: number;
   description: string;
-};
+}
 
-const BILL_SUMMARIES: Record<string, BillSummary> = {
-  HR4366: {
-    billId: "HR4366",
-    title: "Consolidated Appropriations Act, 2024",
-    shortName: "2024 Federal Spending Bill",
-    year: 2024,
-    category: "Annual appropriations",
-    description:
-      "Sets full-year funding levels for most federal agencies and programs — including defense, health, education, transportation, and more. It keeps the government operating and directs how a large share of annual tax revenue is spent."
-  },
-  HR3684: {
-    billId: "HR3684",
-    title: "Infrastructure Investment and Jobs Act (2021)",
-    shortName: "Bipartisan Infrastructure Law",
-    year: 2021,
-    category: "Infrastructure & transportation",
-    description:
-      "Authorizes hundreds of billions in long-term investment in roads, bridges, public transit, rail, ports, airports, broadband, and clean water projects across the country."
-  },
-  HR1319: {
-    billId: "HR1319",
-    title: "American Rescue Plan Act of 2021",
-    shortName: "COVID Rescue Package",
-    year: 2021,
-    category: "COVID relief & economic support",
-    description:
-      "A major pandemic-era relief law that funded stimulus checks, enhanced unemployment benefits, vaccine distribution, school reopening, and aid to state and local governments."
-  },
-  HR5376: {
-    billId: "HR5376",
-    title: "Inflation Reduction Act of 2022",
-    shortName: "Climate & Tax Law",
-    year: 2022,
-    category: "Energy, climate, health & tax enforcement",
-    description:
-      "Funds clean energy and climate programs, extends Affordable Care Act subsidies, and invests in IRS enforcement, partly paid for by changes to corporate and high-income taxes."
-  }
-};
+interface Representative {
+  id: string;
+  name: string;
+  party: string;
+  chamber: string;
+  state: string;
+  twitter?: string;
+  phone?: string;
+}
 
-/**
- * Map each bill to the broad budget categories it most directly influences.
- * These names must match the `name` values coming from the API breakdown.
- */
-const BILL_SPENDING_CATEGORIES: Record<string, string[]> = {
-  HR4366: [
-    "Social Security",
-    "Medicare",
-    "Health (incl. Medicaid)",
-    "National Defense",
-    "Income Security / Safety Net",
-    "Veterans’ Benefits",
-    "Everything Else"
-  ],
-  HR3684: [
-    // Infrastructure is captured inside the "Everything Else" bucket
-    "Everything Else"
-  ],
-  HR1319: [
-    "Health (incl. Medicaid)",
-    "Income Security / Safety Net",
-    "Everything Else"
-  ],
-  HR5376: [
-    "Health (incl. Medicaid)",
-    "Everything Else"
-  ]
-};
+interface Vote {
+  id: string;
+  chamber: string;
+  question: string;
+  description: string;
+  voteDate: string;
+  result: string;
+  billNumber?: string;
+  totalYes: number;
+  totalNo: number;
+}
 
 export default function Home() {
-  const [income, setIncome] = useState<string>("");
-  const [zip, setZip] = useState<string>("");
-  const [result, setResult] = useState<any>(null);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string>("");
-  const [selectedBillId, setSelectedBillId] = useState<string | null>(null);
+  const [salary, setSalary] = useState('');
+  const [zipCode, setZipCode] = useState('');
+  const [filingStatus, setFilingStatus] = useState('single');
+  const [loading, setLoading] = useState(false);
+  
+  const [taxResult, setTaxResult] = useState<TaxResult | null>(null);
+  const [breakdown, setBreakdown] = useState<BudgetBreakdown[]>([]);
+  const [representatives, setRepresentatives] = useState<Representative[]>([]);
+  const [votes, setVotes] = useState<Vote[]>([]);
 
-  async function handleSubmit(event: React.FormEvent) {
-    event.preventDefault();
+  const handleCalculate = async () => {
+    if (!salary || parseFloat(salary) <= 0) {
+      alert('Please enter a valid salary');
+      return;
+    }
+
     setLoading(true);
-    setError("");
-    setResult(null);
-    setSelectedBillId(null);
 
     try {
-      const response = await fetch("/api/tax-receipt", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          income: Number(income),
-          zip: zip
-        })
+      // Calculate tax
+      const taxResponse = await fetch('/api/calculate-tax', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ salary: parseFloat(salary), filingStatus })
       });
+      const taxData = await taxResponse.json();
+      setTaxResult(taxData);
 
-      const data = await response.json();
+      // Get budget breakdown
+      const breakdownResponse = await fetch('/api/budget-breakdown', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ totalTax: taxData.totalFederalTax })
+      });
+      const breakdownData = await breakdownResponse.json();
+      setBreakdown(breakdownData.breakdown || []);
 
-      if (!response.ok) {
-        setError(data.error || "Something went wrong");
-      } else {
-        setResult(data);
+      // Get representatives if zip code provided
+      if (zipCode && zipCode.length === 5) {
+        const repsResponse = await fetch(`/api/representatives?zip=${zipCode}`);
+        const repsData = await repsResponse.json();
+        setRepresentatives(repsData.representatives || []);
       }
-    } catch (err) {
-      setError("Network error");
+
+      // Get recent votes
+      const votesResponse = await fetch('/api/votes?chamber=both');
+      const votesData = await votesResponse.json();
+      setVotes(votesData.votes || []);
+
+    } catch (error) {
+      console.error('Error:', error);
+      alert('Failed to calculate. Please try again.');
     } finally {
       setLoading(false);
     }
-  }
-
-  const formattedTax =
-    result && result.estimatedFederalIncomeTax
-      ? result.estimatedFederalIncomeTax.toLocaleString("en-US", {
-          style: "currency",
-          currency: "USD"
-        })
-      : null;
-
-  const selectedBill: BillSummary | null =
-    selectedBillId && BILL_SUMMARIES[selectedBillId]
-      ? BILL_SUMMARIES[selectedBillId]
-      : null;
-
-  // Compute how much of *this user's* estimated tax is tied to the bill's categories
-  let billTaxSharePercent: number | null = null;
-  let billTaxAmount: number | null = null;
-  let affectedCategories: string[] = [];
-
-  if (
-    selectedBill &&
-    result &&
-    Array.isArray(result.breakdown) &&
-    typeof result.estimatedFederalIncomeTax === "number"
-  ) {
-    const categories =
-      BILL_SPENDING_CATEGORIES[selectedBill.billId] || [];
-    affectedCategories = categories;
-
-    const totalShare = result.breakdown
-      .filter((item: any) => categories.includes(item.name))
-      .reduce((sum: number, item: any) => sum + (item.share || 0), 0);
-
-    if (totalShare > 0) {
-      billTaxSharePercent = Math.round(totalShare * 1000) / 10; // one decimal place
-      billTaxAmount = Math.round(
-        result.estimatedFederalIncomeTax * totalShare
-      );
-    }
-  }
+  };
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background: "linear-gradient(180deg, #f5f5f7, #ffffff)",
-        padding: "32px 16px"
-      }}
-    >
-      <div
-        style={{
-          maxWidth: 1100,
-          margin: "0 auto",
-          display: "flex",
-          flexDirection: "column",
-          gap: 24
-        }}
-      >
-        {/* Header */}
-        <header>
-          <h1 style={{ fontSize: 32, marginBottom: 8 }}>My Tax Receipt</h1>
-          <p style={{ maxWidth: 600, color: "#555", fontSize: 14 }}>
-            Enter your income and ZIP code to see a rough estimate of where your
-            federal income tax goes and how your members of Congress vote on
-            major funding laws that direct that money.
+    <main className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4 md:p-8">
+      <div className="max-w-6xl mx-auto">
+        <header className="text-center mb-8">
+          <h1 className="text-4xl md:text-5xl font-bold text-gray-900 mb-2">
+            Tax Accountability Tracker
+          </h1>
+          <p className="text-lg text-gray-600">
+            See exactly where your tax dollars go and how your representatives vote
           </p>
         </header>
 
-        {/* Input card */}
-        <section
-          style={{
-            background: "#fff",
-            borderRadius: 12,
-            boxShadow: "0 8px 24px rgba(0,0,0,0.06)",
-            padding: 24,
-            border: "1px solid #eee"
-          }}
-        >
-          <form
-            onSubmit={handleSubmit}
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: 16,
-              alignItems: "flex-end"
-            }}
-          >
-            <div style={{ flex: "1 1 200px", minWidth: 0 }}>
-              <label
-                style={{
-                  display: "block",
-                  marginBottom: 4,
-                  fontSize: 14,
-                  fontWeight: 500
-                }}
-              >
-                Income
+        {/* Input Form */}
+        <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Annual Salary ($)
               </label>
               <input
                 type="number"
-                placeholder="e.g. 90000"
-                value={income}
-                onChange={(e) => setIncome(e.target.value)}
-                style={{
-                  width: "100%",
-                  padding: "8px 10px",
-                  borderRadius: 8,
-                  border: "1px solid #ccc",
-                  fontSize: 14
-                }}
+                value={salary}
+                onChange={(e) => setSalary(e.target.value)}
+                placeholder="75000"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             </div>
-
-            <div style={{ flex: "1 1 140px", minWidth: 0 }}>
-              <label
-                style={{
-                  display: "block",
-                  marginBottom: 4,
-                  fontSize: 14,
-                  fontWeight: 500
-                }}
-              >
-                ZIP code
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Zip Code (Optional)
               </label>
               <input
-                placeholder="e.g. 10003"
-                value={zip}
-                onChange={(e) => setZip(e.target.value)}
-                style={{
-                  width: "100%",
-                  padding: "8px 10px",
-                  borderRadius: 8,
-                  border: "1px solid #ccc",
-                  fontSize: 14
-                }}
+                type="text"
+                value={zipCode}
+                onChange={(e) => setZipCode(e.target.value)}
+                placeholder="20001"
+                maxLength={5}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             </div>
-
-            <button
-              type="submit"
-              disabled={loading}
-              style={{
-                padding: "10px 18px",
-                borderRadius: 999,
-                border: "none",
-                background: loading ? "#999" : "#111827",
-                color: "#fff",
-                fontSize: 14,
-                fontWeight: 600,
-                cursor: loading ? "default" : "pointer",
-                minWidth: 120
-              }}
-            >
-              {loading ? "Calculating..." : "Generate"}
-            </button>
-          </form>
-
-          {error && (
-            <p style={{ color: "red", marginTop: 12, fontSize: 14 }}>{error}</p>
-          )}
-
-          {result && (
-            <div style={{ marginTop: 16, fontSize: 14, color: "#444" }}>
-              <div style={{ marginBottom: 4 }}>
-                Estimated federal income tax:{" "}
-                <strong>{formattedTax ?? result.estimatedFederalIncomeTax}</strong>
-              </div>
-              <div>
-                Income bucket: <strong>{result.incomeBucket}</strong>
-              </div>
-            </div>
-          )}
-        </section>
-
-        {/* Main content layout */}
-        <section
-          style={{
-            display: "grid",
-            gridTemplateColumns: "minmax(0, 2.2fr) minmax(0, 2fr)",
-            gap: 24
-          }}
-        >
-          {/* Tax breakdown */}
-          <div>
-            <h2 style={{ fontSize: 20, marginBottom: 8 }}>
-              Where your tax roughly goes
-            </h2>
-            <p style={{ fontSize: 13, color: "#666", marginBottom: 12 }}>
-              Based on broad federal budget categories. This is an approximation,
-              not an official statement.
-            </p>
-
-            {result && result.breakdown ? (
-              <div
-                style={{
-                  background: "#fff",
-                  borderRadius: 12,
-                  border: "1px solid #eee",
-                  overflow: "hidden"
-                }}
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Filing Status
+              </label>
+              <select
+                value={filingStatus}
+                onChange={(e) => setFilingStatus(e.target.value)}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               >
-                {result.breakdown.map((item: any, index: number) => (
-                  <div
-                    key={item.code}
-                    style={{
-                      padding: "10px 14px",
-                      borderTop: index === 0 ? "none" : "1px solid #f0f0f0",
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "baseline"
-                    }}
-                  >
-                    <div>
-                      <strong>{item.name}</strong>
-                      <div
-                        style={{
-                          fontSize: 12,
-                          color: "#777",
-                          marginTop: 2
-                        }}
-                      >
-                        {Math.round(item.share * 100)}% of federal budget
-                      </div>
-                    </div>
-                    <div
-                      style={{
-                        fontWeight: 600,
-                        fontSize: 14
-                      }}
-                    >
-                      $
-                      {item.amount.toLocaleString("en-US", {
-                        minimumFractionDigits: 0,
-                        maximumFractionDigits: 0
-                      })}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div style={{ fontSize: 13, color: "#888", marginTop: 8 }}>
-                Enter your income and ZIP above to generate a tax receipt.
-              </div>
-            )}
+                <option value="single">Single</option>
+                <option value="married">Married Filing Jointly</option>
+              </select>
+            </div>
           </div>
 
-          {/* Right side: Reps + Bill details stacked */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            {/* Representatives */}
-            <div>
-              <h2 style={{ fontSize: 20, marginBottom: 8 }}>Who represents you</h2>
-              <p style={{ fontSize: 13, color: "#666", marginBottom: 12 }}>
-                These are your current members of Congress by ZIP. Below each name
-                you can see how they align on major funding laws that shape where
-                your federal tax dollars go.
-              </p>
+          <button
+            onClick={handleCalculate}
+            disabled={loading}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition duration-200 disabled:opacity-50"
+          >
+            {loading ? 'Calculating...' : 'Calculate My Tax Impact'}
+          </button>
+        </div>
 
-              {result && result.representatives ? (
-                <div
-                  style={{ display: "flex", flexDirection: "column", gap: 10 }}
-                >
-                  {result.representatives.map((rep: any) => (
-                    <div
-                      key={rep.id}
-                      style={{
-                        background: "#fff",
-                        borderRadius: 12,
-                        border: "1px solid #eee",
-                        padding: 12
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "baseline",
-                          marginBottom: 4
-                        }}
-                      >
-                        <div>
-                          <strong>{rep.name}</strong>{" "}
-                          <span style={{ fontSize: 13, color: "#666" }}>
-                            ({rep.party || "?"},{" "}
-                            {rep.chamber === "senate" ? "Senate" : "House"})
-                          </span>
-                        </div>
-                        {rep.source && (
-                          <span style={{ fontSize: 11, color: "#999" }}>
-                            source: {rep.source}
-                          </span>
-                        )}
-                      </div>
-
-                      <div
-                        style={{
-                          fontSize: 12,
-                          color: "#777",
-                          marginBottom: 4
-                        }}
-                      >
-                        Voting on major funding laws:
-                      </div>
-
-                      {rep.votes && rep.votes.length > 0 ? (
-                        <ul
-                          style={{
-                            margin: 0,
-                            paddingLeft: 18,
-                            fontSize: 13,
-                            color: "#444"
-                          }}
-                        >
-                          {rep.votes.map((vote: any, index: number) => (
-                            <li key={index}>
-                              <button
-                                type="button"
-                                onClick={() => setSelectedBillId(vote.billId)}
-                                style={{
-                                  background: "none",
-                                  border: "none",
-                                  padding: 0,
-                                  margin: 0,
-                                  cursor: "pointer",
-                                  color: "#1d4ed8",
-                                  textDecoration: "underline",
-                                  fontSize: 13
-                                }}
-                              >
-                                {vote.billTitle}
-                              </button>
-                              {": "}
-                              <strong
-                                style={{
-                                  color:
-                                    vote.position === "Yea"
-                                      ? "#047857"
-                                      : vote.position === "Nay"
-                                      ? "#b91c1c"
-                                      : "#6b7280"
-                                }}
-                              >
-                                {vote.position}
-                              </strong>
-                            </li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <div style={{ fontSize: 12, color: "#777" }}>
-                          Voting record on specific spending bills coming next.
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div style={{ fontSize: 13, color: "#888", marginTop: 8 }}>
-                  Once you generate a tax receipt, your current House member and
-                  Senators will show up here.
-                </div>
-              )}
+        {/* Tax Summary */}
+        {taxResult && (
+          <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
+            <h2 className="text-2xl font-bold text-gray-900 mb-4">Your Tax Summary</h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="bg-blue-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-600">Income Tax</p>
+                <p className="text-2xl font-bold text-blue-600">
+                  ${taxResult.incomeTax.toLocaleString()}
+                </p>
+              </div>
+              <div className="bg-green-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-600">FICA Tax</p>
+                <p className="text-2xl font-bold text-green-600">
+                  ${taxResult.ficaTax.toLocaleString()}
+                </p>
+              </div>
+              <div className="bg-red-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-600">Total Federal Tax</p>
+                <p className="text-2xl font-bold text-red-600">
+                  ${taxResult.totalFederalTax.toLocaleString()}
+                </p>
+              </div>
+              <div className="bg-purple-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-600">Effective Rate</p>
+                <p className="text-2xl font-bold text-purple-600">
+                  {taxResult.effectiveRate}%
+                </p>
+              </div>
             </div>
+          </div>
+        )}
 
-            {/* Bill detail panel */}
-            <div>
-              <h3 style={{ fontSize: 16, marginBottom: 6 }}>Bill details</h3>
-              {selectedBill ? (
-                <div
-                  style={{
-                    background: "#fff",
-                    borderRadius: 12,
-                    border: "1px solid #eee",
-                    padding: 12,
-                    fontSize: 13
-                  }}
-                >
-                  <div style={{ marginBottom: 4 }}>
-                    <strong>{selectedBill.title}</strong>
+        {/* Budget Breakdown */}
+        {breakdown.length > 0 && (
+          <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
+            <h2 className="text-2xl font-bold text-gray-900 mb-4">
+              Where Your ${taxResult?.totalFederalTax.toLocaleString()} Goes
+            </h2>
+            <div className="space-y-3">
+              {breakdown.map((item, index) => (
+                <div key={index} className="border-b pb-3 last:border-b-0">
+                  <div className="flex justify-between items-center mb-1">
+                    <span className="font-semibold text-gray-900">{item.category}</span>
+                    <span className="text-lg font-bold text-blue-600">
+                      ${item.amount.toLocaleString()}
+                    </span>
                   </div>
-                  <div style={{ color: "#555", marginBottom: 4 }}>
-                    <span>{selectedBill.shortName}</span> •{" "}
-                    <span>{selectedBill.year}</span> •{" "}
-                    <span>{selectedBill.category}</span>
+                  <div className="flex justify-between items-center text-sm text-gray-600">
+                    <span>{item.description}</span>
+                    <span>{item.percentage}%</span>
                   </div>
-                  <p style={{ margin: 0, color: "#444", lineHeight: 1.4 }}>
-                    {selectedBill.description}
+                  <div className="mt-2 bg-gray-200 rounded-full h-2">
+                    <div
+                      className="bg-blue-600 h-2 rounded-full"
+                      style={{ width: `${item.percentage}%` }}
+                    ></div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Representatives */}
+        {representatives.length > 0 && (
+          <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
+            <h2 className="text-2xl font-bold text-gray-900 mb-4">Your Representatives</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {representatives.map((rep) => (
+                <div key={rep.id} className="border rounded-lg p-4">
+                  <h3 className="font-bold text-lg text-gray-900">{rep.name}</h3>
+                  <p className="text-gray-600">
+                    {rep.party} - {rep.chamber}
                   </p>
-
-                  {billTaxSharePercent !== null && billTaxAmount !== null && (
-                    <div
-                      style={{
-                        marginTop: 10,
-                        paddingTop: 8,
-                        borderTop: "1px solid #eee"
-                      }}
-                    >
-                      <div
-                        style={{
-                          fontSize: 12,
-                          color: "#374151",
-                          marginBottom: 2
-                        }}
-                      >
-                        Estimated portion of <strong>your</strong>{" "}
-                        federal income tax tied to the kinds of programs this law
-                        funds:
-                      </div>
-                      <div
-                        style={{
-                          fontSize: 14,
-                          fontWeight: 600,
-                          color: "#111827"
-                        }}
-                      >
-                        ~{billTaxSharePercent}% ({`$${billTaxAmount.toLocaleString(
-                          "en-US"
-                        )}`}
-                        )
-                      </div>
-                      {affectedCategories.length > 0 && (
-                        <div
-                          style={{
-                            marginTop: 4,
-                            fontSize: 11,
-                            color: "#6b7280"
-                          }}
-                        >
-                          Based on your tax going to:{" "}
-                          {affectedCategories.join(", ")}.
-                        </div>
-                      )}
-                    </div>
+                  {rep.twitter && (
+                    <p className="text-sm text-blue-600">@{rep.twitter}</p>
                   )}
-
-                  <div
-                    style={{
-                      marginTop: 8,
-                      fontSize: 11,
-                      color: "#888"
-                    }}
-                  >
-                    This is a rough link between your estimated tax and the
-                    categories this law most directly funds. It&apos;s a simplified
-                    view meant for accountability, not official tax guidance.
-                  </div>
+                  {rep.phone && (
+                    <p className="text-sm text-gray-600">{rep.phone}</p>
+                  )}
                 </div>
-              ) : (
-                <div
-                  style={{
-                    background: "#f9fafb",
-                    borderRadius: 10,
-                    border: "1px dashed #d1d5db",
-                    padding: 10,
-                    fontSize: 12,
-                    color: "#6b7280"
-                  }}
-                >
-                  Click any bill title in the voting history above to see what that
-                  law funded and how much of your estimated federal income tax it
-                  most likely touches.
-                </div>
-              )}
+              ))}
             </div>
           </div>
-        </section>
+        )}
+
+        {/* Recent Votes */}
+        {votes.length > 0 && (
+          <div className="bg-white rounded-lg shadow-lg p-6">
+            <h2 className="text-2xl font-bold text-gray-900 mb-4">Recent Congressional Votes</h2>
+            <div className="space-y-4">
+              {votes.slice(0, 10).map((vote) => (
+                <div key={vote.id} className="border-b pb-4 last:border-b-0">
+                  <div className="flex justify-between items-start mb-2">
+                    <div className="flex-1">
+                      <span className="inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded mr-2">
+                        {vote.chamber}
+                      </span>
+                      {vote.billNumber && (
+                        <span className="inline-block bg-gray-100 text-gray-800 text-xs px-2 py-1 rounded">
+                          {vote.billNumber}
+                        </span>
+                      )}
+                      <h3 className="font-semibold text-gray-900 mt-2">{vote.question}</h3>
+                      {vote.description && (
+                        <p className="text-sm text-gray-600 mt-1">{vote.description}</p>
+                      )}
+                    </div>
+                    <span className={`font-bold ${
+                      vote.result === 'Passed' ? 'text-green-600' : 
+                      vote.result === 'Failed' ? 'text-red-600' : 'text-gray-600'
+                    }`}>
+                      {vote.result}
+                    </span>
+                  </div>
+                  <div className="flex gap-4 text-sm text-gray-600">
+                    <span>Yes: {vote.totalYes}</span>
+                    <span>No: {vote.totalNo}</span>
+                    <span className="text-gray-400">{vote.voteDate}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </main>
   );
