@@ -5,7 +5,7 @@ const CONGRESS_API_KEY = process.env.CONGRESS_API_KEY || '';
 export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
-    const chamber = searchParams.get('chamber') || 'both'; // house, senate, or both
+    const chamber = searchParams.get('chamber') || 'both';
 
     if (!CONGRESS_API_KEY) {
       return NextResponse.json({
