@@ -5,7 +5,7 @@ const CONGRESS_API_KEY = process.env.CONGRESS_API_KEY || '';
 export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
-    const chamber = searchParams.get('chamber') || 'both';
+    const chamber = searchParams.get('chamber') || 'both'; // house, senate, or both
 
     if (!CONGRESS_API_KEY) {
       return NextResponse.json({
@@ -22,7 +22,7 @@ export async function GET(request: NextRequest) {
     if (chamber === 'house' || chamber === 'both') {
       try {
         const houseResponse = await fetch(
-          `https://api.congress.gov/v3/vote/${congress}/house?limit=10&api_key=${CONGRESS_API_KEY}`,
+          `https://api.congress.gov/v3/vote/${congress}/house?limit=10&format=json&api_key=${CONGRESS_API_KEY}`,
           {
             headers: {
               'Accept': 'application/json'
@@ -55,7 +55,7 @@ export async function GET(request: NextRequest) {
     if (chamber === 'senate' || chamber === 'both') {
       try {
         const senateResponse = await fetch(
-          `https://api.congress.gov/v3/vote/${congress}/senate?limit=10&api_key=${CONGRESS_API_KEY}`,
+          `https://api.congress.gov/v3/vote/${congress}/senate?limit=10&format=json&api_key=${CONGRESS_API_KEY}`,
           {
             headers: {
               'Accept': 'application/json'
