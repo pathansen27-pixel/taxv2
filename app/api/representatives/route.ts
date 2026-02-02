@@ -40,7 +40,7 @@ export async function GET(request: NextRequest) {
       try {
         // Get current members from Congress.gov API
         const membersResponse = await fetch(
-          `https://api.congress.gov/v3/member?currentMember=true&limit=250&api_key=${CONGRESS_API_KEY}`,
+          `https://api.congress.gov/v3/member?currentMember=true&limit=250&format=json&api_key=${CONGRESS_API_KEY}`,
           {
             headers: {
               'Accept': 'application/json'
@@ -51,15 +51,20 @@ export async function GET(request: NextRequest) {
         if (membersResponse.ok) {
           const data = await membersResponse.json();
           
-          // Filter for the user's state
-          const stateReps = data.members?.filter((member: any) => 
-            member.state === state
-          ) || [];
+          // The API returns data.members as an array
+          const allMembers = data.members || [];
+          
+          // Filter for the user's state (state is stored in member.state)
+          const stateReps = allMembers.filter((member: any) => {
+            // Try both member.state and member.terms[0]?.state
+            const memberState = member.state || member.terms?.item?.[0]?.state;
+            return memberState === state;
+          });
 
           representatives.push(...stateReps.map((member: any) => ({
-            id: member.bioguideId,
+            id: member.bioguideId || member.id,
             name: member.name,
-            party: member.partyName,
+            party: member.partyName || member.party,
             chamber: member.terms?.item?.[0]?.chamber || 'Unknown',
             state: member.state,
             district: member.district,
